@@ -393,10 +393,17 @@ def main() -> int:
     )
 
     correct = sum(bool(row["correct"]) for row in rows)
+    total_generated_tokens = sum(int(row.get("generated_tokens", 0)) for row in rows)
+    total_elapsed_s = sum(float(row.get("elapsed_s", 0.0)) for row in rows)
     summary = {"backend": args.backend, "model": args.model, "data_file": args.data_file,
                "count": len(rows), "correct": correct, "accuracy": correct / len(rows) if rows else None,
                "extraction_failures": sum(row.get("prediction") is None for row in rows),
                "mean_tokens_per_second": statistics.fmean(speeds) if speeds else None,
+               "generated_tokens": total_generated_tokens,
+               "elapsed_s": total_elapsed_s,
+               "end_to_end_tokens_per_second": (
+                   total_generated_tokens / total_elapsed_s if total_elapsed_s else None
+               ),
                "serial_speed": ({
                    "generated_tokens": serial_tokens,
                    "rounds": serial_rounds,

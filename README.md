@@ -547,6 +547,12 @@ GSM8K `summary.json` and MT-Bench candidate summaries contain a weighted
 `serial_speed` aggregate computed as total generated tokens divided by summed
 phase time, rather than an unweighted mean of per-turn rates.
 
+GSM8K also reports `end_to_end_tokens_per_second` for every backend. It is the
+sum of all generated tokens divided by the sum of all measured request times,
+including prompt prefills but excluding warmup runs. Use this field for a
+same-workload comparison between the serial and asynchronous systems;
+`mean_tokens_per_second` remains the unweighted mean of per-example rates.
+
 The launchers default to
 `/home/hwc/workspace/thirdparty/grade-school-math/grade_school_math/data/test.jsonl`.
 Use environment variables to override paths/settings, and append evaluator
