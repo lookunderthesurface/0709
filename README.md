@@ -77,10 +77,11 @@ The first-token check is evaluated first. Log probabilities are negative, so a
 threshold closer to zero is stricter: `-0.50` rejects more paths than `-1.00`.
 If fallback triggers, Target greedily generates at most
 `--fallback-ar-tokens` tokens, commits them to its persistent KV, and returns
-them to the Edge. The Edge then discards all current draft routes, appends the
-AR tokens to `generated_text`, and rebuilds the Drafter stage-1 routes from the
-new committed prefix. Unselected forest routes are never reused after a
-fallback.
+them to the Edge. The Edge discards all current speculative routes while
+preserving the committed Drafter prefix KV, appends all AR tokens with one
+multi-token SGLang EXTEND forward, and builds new stage-1 routes from the last
+EXTEND logits. It never re-prefills the historical prefix. Unselected forest
+routes are never reused after a fallback.
 
 The current recommended configuration for `k=3, d=4` is:
 

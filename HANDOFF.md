@@ -70,8 +70,9 @@ These are Target-server flags and must be set when starting Target:
 For `d=4`, earlier Target token log probabilities have larger weights. Fallback
 is selected when the first token or the weighted complete-path score is below
 its threshold. Target then greedily generates up to four AR tokens, commits
-them, and the Edge discards all draft routes and rebuilds stage-1 from the new
-committed prefix.
+them, and the Edge discards speculative routes, preserves committed Drafter
+prefix KV, appends the fallback suffix with one multi-token EXTEND, and builds
+stage-1 from the final EXTEND logits without historical re-prefill.
 
 Thresholds are empirical starting points, not universal values:
 

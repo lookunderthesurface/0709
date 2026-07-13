@@ -51,9 +51,10 @@ Fallback is triggered in this order:
 
 Because log probabilities are negative, a value closer to zero is stricter.
 For example, `-0.50` triggers more often than `-1.00`. On fallback, Target
-greedily generates up to `fallback_ar_tokens` tokens, commits them in place,
-and the Edge drops all draft routes and rebuilds stage-1 from the resulting
-committed prefix.
+greedily generates up to `fallback_ar_tokens` tokens and commits them in place.
+The Edge drops speculative routes but preserves committed Drafter prefix KV,
+appends the known suffix with one multi-token EXTEND, and builds the next
+stage-1 tree from the final logits without historical re-prefill.
 
 ## Start Target Server
 

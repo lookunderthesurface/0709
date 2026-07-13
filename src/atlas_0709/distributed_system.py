@@ -340,25 +340,16 @@ class PagedDistributedAtlasGenerator:
                     generated.extend(committed_now)
                     committed.extend(committed_now)
                     should_stop = not committed_now or self._should_stop(committed_now, generated)
-                    handoff_mode = "fallback_ar_stopped" if should_stop else "fallback_ar_rebuild_prefix"
+                    handoff_mode = "fallback_ar_stopped" if should_stop else "fallback_ar_extend_prefix_kv"
                     if not should_stop:
-                        rebuild_start_s = self._timeline_now()
-                        ctx = self._prepare_prefix(committed)
-                        active_routes = initialize_stage1_routes(
-                            ctx.prefix,
-                            k=self.config.k,
-                            route_store=ctx.store,
-                        )
-                        stage1 = build_tree_depths(
-                            active_routes,
-                            depth=self.config.d,
-                            k=self.config.k,
-                            route_store=ctx.store,
-                            model_backend=ctx.backend,
+                        extend_start_s = self._timeline_now()
+                        stage1, physical_stats = self._fallback_extend_handoff(
+                            ctx=ctx,
+                            fallback_token_ids=committed_now,
                         )
                         handoff_span = EdgeSpan(
-                            name="edge_fallback_rebuild_tree",
-                            start_s=rebuild_start_s,
+                            name="edge_fallback_extend_then_build_tree",
+                            start_s=extend_start_s,
                             end_s=self._timeline_now(),
                         )
                 elif decision == "select":
@@ -475,6 +466,8 @@ class PagedDistributedAtlasGenerator:
                 "max_new_tokens": self.config.max_new_tokens,
                 "fallback_ar_tokens": int(self.config.fallback_ar_tokens),
                 "rebuild_drafter_prefix_after_commit": False,
+                "rebuild_drafter_prefix_after_fallback": False,
+                "fallback_drafter_handoff": "single_multi_token_extend",
                 "rebuild_target_prefix_after_commit": False,
                 "cross_round_stage2_kv_reuse": True,
                 "target_selection_policy": "best_of_n_full_path_with_optional_target_ar_fallback",
@@ -533,6 +526,62 @@ class PagedDistributedAtlasGenerator:
         )
         store.committed_token_ids = [int(token_id) for token_id in committed]
         return PagedPrefixContext(store=store, backend=backend, prefix=prefix)
+
+    def _fallback_extend_handoff(
+        self,
+        *,
+        ctx: PagedPrefixContext,
+        fallback_token_ids: Sequence[int],
+    ) -> tuple[BuildDepthsOutput, dict[str, int]]:
+        """Discard speculative work, extend persistent prefix KV, and rebuild stage-1."""
+        suffix = [int(token_id) for token_id in fallback_token_ids]
+        if not suffix:
+            raise ValueError("fallback handoff requires at least one Target token")
+
+        # No forest kernel is in flight here: the verify/forest loop only
+        # checks the decision after the current full decode step has returned.
+        # Dropping every route row first makes route_slot_paths stop retaining
+        # speculative pages; committed prefix pages remain protected by
+        # route_pool.prefix_page_ids.
+        released_rows = ctx.backend.route_pool.retain_route_rows([])
+        released_pages = ctx.backend.route_pool.release_unreferenced_node_slots([])
+        ctx.store.committed_token_ids.extend(suffix)
+        ctx.store.reset_speculative()
+
+        next_token_logits = ctx.backend.append_known_tokens_as_prefix(suffix)
+        prefix_tokens = tuple(int(token_id) for token_id in ctx.backend.prefix_token_ids)
+        prefix = DraftPrefixState(
+            token_ids=torch.tensor(
+                prefix_tokens,
+                device=next_token_logits.device,
+                dtype=torch.long,
+            ),
+            prefix_kv_view=ctx.store.prefix_view(),
+            next_token_logits=(
+                next_token_logits.unsqueeze(0)
+                if next_token_logits.ndim == 1
+                else next_token_logits
+            ),
+            committed_length=len(prefix_tokens),
+        )
+        active_routes = initialize_stage1_routes(
+            prefix,
+            k=self.config.k,
+            route_store=ctx.store,
+        )
+        stage1 = build_tree_depths(
+            active_routes,
+            depth=self.config.d,
+            k=self.config.k,
+            route_store=ctx.store,
+            model_backend=ctx.backend,
+        )
+        return stage1, {
+            "committed_kv_tokens": len(suffix),
+            "retained_routes": 0,
+            "released_route_rows": released_rows,
+            "released_kv_pages": released_pages,
+        }
 
     def _handoff_after_verify(
         self,
