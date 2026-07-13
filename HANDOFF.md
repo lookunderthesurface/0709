@@ -98,6 +98,10 @@ The serial path uses the same weighted scoring and fallback settings as async,
 but does not reuse stage-2 Drafter KV across rounds. It is a benchmark baseline,
 not a replacement for the production async algorithm.
 
+The GSM8K serial launcher is now a single-process path: Drafter and Target are
+loaded by `gsm8k_eval.py`, Target verification is an in-process method call,
+and no Target HTTP server or `TARGET_URL` is involved.
+
 Relevant files:
 
 ```text

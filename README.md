@@ -474,6 +474,12 @@ For a single-GPU scheduling baseline, use the serial ATLAS launcher:
 bash scripts/run_gsm8k_atlas_serial.sh
 ```
 
+This launcher is self-contained: it loads both the Drafter and Target in one
+Python process and calls Target verification directly in process. Do not start
+`target_server`, and do not pass `TARGET_URL`, for this serial quality/speed
+test. Configure the local Target with `TARGET_MODEL`, `PATH_SCORE_WEIGHTS`,
+`FALLBACK_THRESHOLD`, `FIRST_TOKEN_THRESHOLD`, and `FALLBACK_AR_TOKENS`.
+
 The serial launcher keeps the same 1B Drafter, 8B Target, weighted path
 scoring, and Target fallback configuration, but enforces this order for every
 round:

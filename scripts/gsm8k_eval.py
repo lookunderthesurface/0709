@@ -180,7 +180,7 @@ def create_atlas(args: argparse.Namespace, *, serial: bool = False):
     from transformers import AutoTokenizer
     from atlas_0709.distributed_system import DistributedAtlasConfig, PagedDistributedAtlasGenerator
     from atlas_0709.flashinfer_paged.sglang_runtime import SGLangRunnerConfig, create_sglang_model_runner
-    from atlas_0709.rpc import RemoteTargetClient
+    from atlas_0709.rpc import InProcessTargetClient, RemoteTargetClient
 
     atlas_generator_class = PagedDistributedAtlasGenerator
     if serial:
@@ -189,7 +189,34 @@ def create_atlas(args: argparse.Namespace, *, serial: bool = False):
         atlas_generator_class = SerialAtlasGenerator
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
-    target = RemoteTargetClient(args.target_url, timeout=args.target_timeout)
+    if serial:
+        from atlas_0709.flashinfer_full_verify import FlashInferFullVerifyConfig
+        from atlas_0709.target_runtime import DirectFlashInferMaskedTreeVerifyBackend
+
+        weights = tuple(
+            float(value.strip())
+            for value in args.path_score_weights.split(",")
+            if value.strip()
+        )
+        target = InProcessTargetClient(
+            DirectFlashInferMaskedTreeVerifyBackend(
+                model_path=args.target_model,
+                config=FlashInferFullVerifyConfig(
+                    k=args.k, d=args.d, prefix_len=args.context_length,
+                    page_size=args.page_size, dtype=args.dtype, device="cuda",
+                    workspace_mb=args.target_workspace_mb,
+                    trust_remote_code=args.trust_remote_code,
+                    use_packed_custom_mask=args.use_packed_custom_mask,
+                    check_logit_alignment=False,
+                ),
+                score_weights=weights,
+                fallback_threshold=args.fallback_threshold,
+                first_token_threshold=args.first_token_threshold,
+                fallback_ar_tokens=args.fallback_ar_tokens,
+            )
+        )
+    else:
+        target = RemoteTargetClient(args.target_url, timeout=args.target_timeout)
     health = target.health()
     runner = create_sglang_model_runner(SGLangRunnerConfig(
         model_path=args.model, dtype=args.dtype, context_length=args.context_length,
@@ -223,6 +250,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=["ar", "atlas", "atlas_serial"], required=True)
     parser.add_argument("--model", required=True, help="AR model or ATLAS drafter model")
     parser.add_argument("--target-url", default="http://127.0.0.1:18090")
+    parser.add_argument("--target-model", default="/home/hwc/models/Meta-Llama-3.1-8B-Instruct",
+                        help="In-process Target model used by atlas_serial; no Target server is needed")
     parser.add_argument("--data-file", default=DEFAULT_DATA_FILE)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--start", type=int, default=0)
@@ -249,6 +278,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--d", type=int, default=4)
     parser.add_argument("--fallback-ar-tokens", type=int, default=4)
+    parser.add_argument("--path-score-weights", default="0.45,0.30,0.17,0.08")
+    parser.add_argument("--fallback-threshold", type=float, default=-0.50)
+    parser.add_argument("--first-token-threshold", type=float, default=-0.70)
+    parser.add_argument("--target-workspace-mb", type=int, default=128)
+    parser.add_argument("--use-packed-custom-mask", action="store_true")
     parser.add_argument("--target-timeout", type=float, default=600.0)
     return parser
 

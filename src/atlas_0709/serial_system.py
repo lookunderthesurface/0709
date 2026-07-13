@@ -19,7 +19,7 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
 
     This intentionally omits forest construction, asynchronous overlap, and
     stage-2 KV handoff. It keeps the same Drafter, Target, route scoring, and
-    fallback RPC as the distributed generator so benchmark quality comparisons
+    fallback behavior as the distributed generator so benchmark quality comparisons
     isolate scheduling overhead on a shared GPU.
     """
 
@@ -172,6 +172,7 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                 "serial_phase_order": "drafter_build_tree_then_target_verify",
                 "drafter_backend": "sglang_flashinfer_paged_decode",
                 "target_backend": "direct_flashinfer_full_llama_masked_verify",
+                "target_transport": str(target_health.get("transport", "http")),
                 "target_health": target_health,
                 "k": self.config.k,
                 "d": self.config.d,

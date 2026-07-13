@@ -104,6 +104,45 @@ class TargetServerApp:
         }
 
 
+@dataclass
+class InProcessTargetClient:
+    """Target client compatible with the generators, without HTTP or threads."""
+
+    backend: DirectFlashInferMaskedTreeVerifyBackend
+
+    def health(self) -> dict[str, object]:
+        return {
+            "ok": True,
+            "service": "atlas_0709_target_in_process",
+            "transport": "in_process",
+            "metadata": self.backend.runtime_metadata(),
+        }
+
+    def prefill(self, prompt_token_ids: Sequence[int]) -> dict[str, object]:
+        prefix = self.backend.prefill(prompt_token_ids)
+        return {
+            "ok": True,
+            "prompt_len": int(prefix.committed_length),
+            "metadata": dict(prefix.metadata),
+        }
+
+    def verify(
+        self,
+        *,
+        prefix_token_ids: Sequence[int],
+        routes: Sequence[Mapping[str, object]],
+        fallback_max_tokens: int | None = None,
+        eos_token_id: int | None = None,
+    ) -> dict[str, object]:
+        result = self.backend.verify_payloads(
+            prefix_token_ids=prefix_token_ids,
+            routes=[verify_payload_from_mapping(dict(item)) for item in routes],
+            fallback_max_tokens=fallback_max_tokens,
+            eos_token_id=eos_token_id,
+        )
+        return {"ok": True, **target_verify_result_to_dict(result)}
+
+
 def make_target_handler(app: TargetServerApp) -> type[BaseHTTPRequestHandler]:
     class TargetRPCHandler(BaseHTTPRequestHandler):
         server_version = "Atlas0709TargetRPC/0.1"
