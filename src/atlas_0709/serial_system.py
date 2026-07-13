@@ -187,6 +187,7 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
             text = self.tokenizer.decode(committed, skip_special_tokens=False)
         total_elapsed_s = time.perf_counter() - total_start
         generated_tokens = len(generated)
+        fallback_rounds = sum(trace.decision == "fallback_ar" for trace in traces)
         return DistributedGenerationResult(
             prompt_token_ids=[int(token_id) for token_id in prompt_token_ids],
             generated_token_ids=generated,
@@ -220,6 +221,9 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                 # tokens actually committed to the generated response. Target
                 # prompt prefill is reported separately and excluded here.
                 "generated_tokens": generated_tokens,
+                "rounds": len(traces),
+                "fallback_rounds": fallback_rounds,
+                "fallback_rate": fallback_rounds / len(traces) if traces else None,
                 "drafter_elapsed_s": drafter_elapsed_s,
                 "target_elapsed_s": target_elapsed_s,
                 "total_elapsed_s": total_elapsed_s,

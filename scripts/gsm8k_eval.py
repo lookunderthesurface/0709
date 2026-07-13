@@ -371,15 +371,36 @@ def main() -> int:
         tokens = sum(int(meta.get("generated_tokens", 0)) for meta in serial_metrics)
         return tokens / elapsed if elapsed else None
 
+    serial_tokens = sum(int(meta.get("generated_tokens", 0)) for meta in serial_metrics)
+    serial_rounds = sum(int(meta.get("rounds", 0)) for meta in serial_metrics)
+    serial_fallback_rounds = sum(
+        int(meta.get("fallback_rounds", 0)) for meta in serial_metrics
+    )
+    serial_drafter_elapsed_s = sum(
+        float(meta.get("drafter_elapsed_s", 0.0)) for meta in serial_metrics
+    )
+    serial_target_elapsed_s = sum(
+        float(meta.get("target_elapsed_s", 0.0)) for meta in serial_metrics
+    )
+    serial_total_elapsed_s = sum(
+        float(meta.get("total_elapsed_s", 0.0)) for meta in serial_metrics
+    )
+
     correct = sum(bool(row["correct"]) for row in rows)
     summary = {"backend": args.backend, "model": args.model, "data_file": args.data_file,
                "count": len(rows), "correct": correct, "accuracy": correct / len(rows) if rows else None,
                "extraction_failures": sum(row.get("prediction") is None for row in rows),
                "mean_tokens_per_second": statistics.fmean(speeds) if speeds else None,
                "serial_speed": ({
-                   "generated_tokens": sum(
-                       int(meta.get("generated_tokens", 0)) for meta in serial_metrics
+                   "generated_tokens": serial_tokens,
+                   "rounds": serial_rounds,
+                   "fallback_rounds": serial_fallback_rounds,
+                   "fallback_rate": (
+                       serial_fallback_rounds / serial_rounds if serial_rounds else None
                    ),
+                   "drafter_elapsed_s": serial_drafter_elapsed_s,
+                   "target_elapsed_s": serial_target_elapsed_s,
+                   "total_elapsed_s": serial_total_elapsed_s,
                    "drafter_tokens_per_second": aggregate_serial_speed("drafter_elapsed_s"),
                    "target_tokens_per_second": aggregate_serial_speed("target_elapsed_s"),
                    "overall_tokens_per_second": aggregate_serial_speed("total_elapsed_s"),
