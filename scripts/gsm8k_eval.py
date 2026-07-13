@@ -385,6 +385,12 @@ def main() -> int:
     serial_total_elapsed_s = sum(
         float(meta.get("total_elapsed_s", 0.0)) for meta in serial_metrics
     )
+    serial_fallback_appended_tokens = sum(
+        int(meta.get("fallback_appended_tokens", 0)) for meta in serial_metrics
+    )
+    serial_fallback_append_elapsed_s = sum(
+        float(meta.get("fallback_append_elapsed_s", 0.0)) for meta in serial_metrics
+    )
 
     correct = sum(bool(row["correct"]) for row in rows)
     summary = {"backend": args.backend, "model": args.model, "data_file": args.data_file,
@@ -401,6 +407,13 @@ def main() -> int:
                    "drafter_elapsed_s": serial_drafter_elapsed_s,
                    "target_elapsed_s": serial_target_elapsed_s,
                    "total_elapsed_s": serial_total_elapsed_s,
+                   "fallback_appended_tokens": serial_fallback_appended_tokens,
+                   "fallback_append_elapsed_s": serial_fallback_append_elapsed_s,
+                   "fallback_append_tokens_per_second": (
+                       serial_fallback_appended_tokens / serial_fallback_append_elapsed_s
+                       if serial_fallback_append_elapsed_s else None
+                   ),
+                   "fallback_drafter_append_mode": "single_multi_token_extend",
                    "drafter_tokens_per_second": aggregate_serial_speed("drafter_elapsed_s"),
                    "target_tokens_per_second": aggregate_serial_speed("target_elapsed_s"),
                    "overall_tokens_per_second": aggregate_serial_speed("total_elapsed_s"),

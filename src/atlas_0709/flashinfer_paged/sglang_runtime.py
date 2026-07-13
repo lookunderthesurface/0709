@@ -637,6 +637,83 @@ class SGLangFlashInferFrontierModelBackend:
             committed_length=len(self.prefix_token_ids),
         )
 
+    @torch.inference_mode()
+    def append_known_tokens_as_prefix(
+        self,
+        token_ids: Sequence[int],
+    ) -> torch.Tensor:
+        """Append a known causal suffix with one SGLang EXTEND forward."""
+        suffix = tuple(int(token_id) for token_id in token_ids)
+        if not suffix:
+            raise ValueError("known prefix extension cannot be empty")
+        prefix_slots = self.route_pool.prefix_slot_ids
+        if prefix_slots is None or int(prefix_slots.numel()) != len(self.prefix_token_ids):
+            raise RuntimeError("persistent Drafter prefix slots are not initialized")
+
+        ForwardBatch, ForwardMode = _sglang_forward_batch_classes()
+        device = self.route_pool.device
+        prefix_len = len(self.prefix_token_ids)
+        suffix_len = len(suffix)
+        seq_len = prefix_len + suffix_len
+        input_ids = torch.tensor(suffix, device=device, dtype=torch.long)
+
+        handle = _PoolReqHandle(rid="atlas-known-prefix-extend")
+        indices = self.route_pool.req_to_token_pool.alloc([handle])
+        if indices is None:
+            raise RuntimeError("SGLang ReqToTokenPool.alloc returned None for known-token extend")
+        req_pool_index = int(_int_list(indices)[0])
+        handle.req_pool_idx = req_pool_index
+        try:
+            last_loc = int(prefix_slots[-1].detach().cpu().item()) if prefix_len else -1
+            suffix_slots = self.route_pool.allocate_extend_slots(
+                prefix_lens=[prefix_len],
+                seq_lens=[seq_len],
+                last_locs=[last_loc],
+            )
+            full_slots = torch.cat([prefix_slots, suffix_slots], dim=0)
+            self.route_pool._write_req_token_row(req_pool_index, full_slots)
+
+            req_pool_indices = torch.tensor([req_pool_index], device=device, dtype=torch.long)
+            seq_lens = torch.tensor([seq_len], device=device, dtype=torch.long)
+            extend_seq_lens = torch.tensor([suffix_len], device=device, dtype=torch.long)
+            extend_prefix_lens = torch.tensor([prefix_len], device=device, dtype=torch.long)
+            forward_batch = ForwardBatch(
+                forward_mode=_forward_mode(ForwardMode, ("EXTEND", "PREFILL")),
+                batch_size=1,
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out_cache_loc=suffix_slots,
+                seq_lens_sum=seq_len,
+                orig_seq_lens=seq_lens,
+                positions=torch.arange(prefix_len, seq_len, device=device, dtype=torch.long),
+                seq_lens_cpu=seq_lens.detach().cpu(),
+                capture_hidden_mode=_capture_hidden_mode_null(),
+                is_extend_in_batch=True,
+                all_extend_in_batch=True,
+                extend_num_tokens=suffix_len,
+                extend_seq_lens=extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_start_loc=torch.tensor([0], device=device, dtype=torch.long),
+                extend_seq_lens_cpu=[suffix_len],
+                extend_prefix_lens_cpu=[prefix_len],
+                extend_logprob_start_lens_cpu=[suffix_len - 1],
+            )
+            ensure_sglang_runner_runtime_defaults(self.executor.model_runner)
+            ensure_sglang_eager_runner(self.executor.model_runner)
+            output = self.executor.model_runner.forward(forward_batch)
+            logits = _extract_next_token_logits(output)
+            _sync_cuda_if_needed()
+        finally:
+            if hasattr(self.route_pool.req_to_token_pool, "free"):
+                self.route_pool.req_to_token_pool.free(handle)
+
+        self.route_pool.set_prefix_slots(full_slots)
+        self.prefix_token_ids = (*self.prefix_token_ids, *suffix)
+        if logits.ndim == 1:
+            return logits
+        return logits[-1]
+
     def set_prefix(self, token_ids: Sequence[int]) -> None:
         self.prefix_token_ids = tuple(int(token_id) for token_id in token_ids)
 

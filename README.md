@@ -493,8 +493,9 @@ Drafter build tree (d steps)
 
 It never builds forest or overlaps Drafter and Target work. It preserves the
 committed Drafter prefix KV across rounds, but does not have stage-2 Drafter KV
-to reuse. Target fallback tokens are appended through the Drafter decode path
-without replaying the historical prefix. This is a quality-matched scheduling
+to reuse. All Target fallback tokens are appended to the Drafter KV with one
+multi-token SGLang EXTEND forward, without replaying the historical prefix or
+running one decode call per token. This is a quality-matched scheduling
 baseline, not the production asynchronous algorithm. Its throughput is the
 appropriate comparison for measuring whether the asynchronous implementation
 is slowed by single-GPU contention.

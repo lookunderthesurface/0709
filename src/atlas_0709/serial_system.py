@@ -11,7 +11,7 @@ from .distributed_system import (
     PagedDistributedAtlasGenerator,
 )
 from .flashinfer_paged.builders import build_tree_depths, initialize_stage1_routes
-from .flashinfer_paged.types import DecodePhase, DraftPrefixState, PrefixKVView, RouteState
+from .flashinfer_paged.types import DraftPrefixState, PrefixKVView, RouteState
 from .rpc import selected_route_id_from_response
 
 
@@ -42,6 +42,8 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
         round_index = 0
         drafter_elapsed_s = 0.0
         target_elapsed_s = 0.0
+        fallback_append_elapsed_s = 0.0
+        fallback_appended_tokens = 0
         total_start = time.perf_counter()
         while len(generated) < self.config.max_new_tokens:
             drafter_start = time.perf_counter()
@@ -147,7 +149,11 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                 )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            drafter_elapsed_s += time.perf_counter() - handoff_start
+            handoff_elapsed_s = time.perf_counter() - handoff_start
+            drafter_elapsed_s += handoff_elapsed_s
+            if decision == "fallback_ar":
+                fallback_append_elapsed_s += handoff_elapsed_s
+                fallback_appended_tokens += len(committed_now)
             traces.append(
                 DistributedRoundTrace(
                     round_index=round_index,
@@ -224,6 +230,13 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                 "rounds": len(traces),
                 "fallback_rounds": fallback_rounds,
                 "fallback_rate": fallback_rounds / len(traces) if traces else None,
+                "fallback_drafter_append_mode": "single_multi_token_extend",
+                "fallback_appended_tokens": fallback_appended_tokens,
+                "fallback_append_elapsed_s": fallback_append_elapsed_s,
+                "fallback_append_tokens_per_second": (
+                    fallback_appended_tokens / fallback_append_elapsed_s
+                    if fallback_append_elapsed_s else None
+                ),
                 "drafter_elapsed_s": drafter_elapsed_s,
                 "target_elapsed_s": target_elapsed_s,
                 "total_elapsed_s": total_elapsed_s,
@@ -271,33 +284,18 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
         ctx,
         token_ids: Sequence[int],
     ) -> tuple[DraftPrefixState, dict[str, int]]:
-        """Materialize known Target AR tokens into the persistent Drafter KV."""
+        """Append all known Target AR tokens with one Drafter EXTEND forward."""
         if not token_ids:
             raise ValueError("fallback append requires at least one token")
-        route_id = ctx.store.allocate_route_id()
-        route = ctx.store.register_route(
-            RouteState(
-                route_id=route_id,
-                stage1_root_id=route_id,
-                parent_route_id=None,
-                materialized_leaf_node_id=None,
-                pending_token_id=int(token_ids[0]),
-                cumulative_logprob=0.0,
-                stage1_depth=0,
-                stage2_depth=0,
-                kv_view=ctx.store.prefix_view().fork(),
-            )
-        )
-        logits: torch.Tensor | None = None
-        for index, token_id in enumerate(token_ids):
-            route.pending_token_id = int(token_id)
-            output = ctx.backend.decode_frontier_one_token([route])
-            ctx.store.mark_routes_materialized(
-                [route],
-                [int(output.new_node_ids.reshape(-1)[0])],
-                phase=DecodePhase.STAGE1,
-            )
-            logits = output.next_token_logits
-        assert logits is not None
-        stats = self._commit_route_as_prefix(ctx=ctx, route=route)
-        return self._persistent_prefix_state(ctx=ctx, next_token_logits=logits[0]), stats
+        released_rows = ctx.backend.route_pool.retain_route_rows([])
+        released_pages = ctx.backend.route_pool.release_unreferenced_node_slots([])
+        ctx.store.committed_token_ids.extend(int(token_id) for token_id in token_ids)
+        ctx.store.reset_speculative()
+        logits = ctx.backend.append_known_tokens_as_prefix(token_ids)
+        stats = {
+            "committed_kv_tokens": len(token_ids),
+            "retained_routes": 0,
+            "released_route_rows": released_rows,
+            "released_kv_pages": released_pages,
+        }
+        return self._persistent_prefix_state(ctx=ctx, next_token_logits=logits), stats
