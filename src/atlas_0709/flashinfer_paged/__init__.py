@@ -1,0 +1,73 @@
+"""Clean SGLang + FlashInfer paged batch decode path.
+
+This package is the useful 0705 execution chain, separated from the reference
+HF/SDPA controller and from the old synthetic/Cascade experiments. It provides
+ordinary FlashInfer paged batch decode for ATLAS tree and forest construction.
+It is not a Cascade/shared-prefix optimized backend.
+"""
+
+from .builders import (
+    build_forest_depths,
+    build_forest_one_depth,
+    build_tree_depths,
+    build_tree_one_depth,
+    initialize_forest_routes,
+    initialize_stage1_routes,
+)
+from .flashinfer_backends import SGLangFlashInferPagedDecodeBackend, SGLangRouteKVMetadata
+from .kv import KVTreeNode, KVTreeStore
+from .sglang_runtime import (
+    SGLangFlashInferFrontierModelBackend,
+    SGLangMemoryPoolBundle,
+    SGLangPrefillResult,
+    SGLangRoutePoolBridge,
+    SGLangRouteRow,
+    SGLangRunnerConfig,
+    assert_sglang_flashinfer_active,
+    create_sglang_model_runner,
+    prefill_sglang_prefix,
+    sglang_runner_component_report,
+)
+from .types import (
+    BuildDepthsOutput,
+    DecodePhase,
+    DraftPrefixState,
+    FrontierDecodeOutput,
+    FrontierStepOutput,
+    PendingCandidate,
+    PrefixKVView,
+    RouteKVView,
+    RouteState,
+)
+
+__all__ = [
+    "BuildDepthsOutput",
+    "DecodePhase",
+    "DraftPrefixState",
+    "FrontierDecodeOutput",
+    "FrontierStepOutput",
+    "KVTreeNode",
+    "KVTreeStore",
+    "PendingCandidate",
+    "PrefixKVView",
+    "RouteKVView",
+    "RouteState",
+    "SGLangFlashInferFrontierModelBackend",
+    "SGLangFlashInferPagedDecodeBackend",
+    "SGLangMemoryPoolBundle",
+    "SGLangPrefillResult",
+    "SGLangRoutePoolBridge",
+    "SGLangRouteRow",
+    "SGLangRouteKVMetadata",
+    "SGLangRunnerConfig",
+    "assert_sglang_flashinfer_active",
+    "build_forest_depths",
+    "build_forest_one_depth",
+    "build_tree_depths",
+    "build_tree_one_depth",
+    "create_sglang_model_runner",
+    "initialize_forest_routes",
+    "initialize_stage1_routes",
+    "prefill_sglang_prefix",
+    "sglang_runner_component_report",
+]

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-0709"
+version = "0.1.0"
+description = "ATLAS 0709: fast paged tree/forest drafting with persistent asynchronous Target verification."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.6",
+]
+
+[project.optional-dependencies]
+hf = [
+    "transformers>=4.45",
+    "accelerate>=0.34",
+    "safetensors>=0.4",
+]
+sglang-flashinfer = [
+    "transformers==5.8.1",
+    "accelerate",
+    "safetensors",
+    "flashinfer-python==0.6.12",
+    "sglang==0.5.14",
+]
+
+[project.scripts]
+atlas-0709-run = "atlas_0709.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

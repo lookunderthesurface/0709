@@ -1,0 +1,213 @@
+{
+  "generated_token_ids": [
+    26061,
+    3,
+    4,
+    5,
+    6,
+    31,
+    2,
+    4
+  ],
+  "metadata": {
+    "cross_round_stage2_kv_reuse": true,
+    "cross_round_target_kv_reuse": true,
+    "d": 4,
+    "drafter_backend": "sglang_flashinfer_paged_decode",
+    "drafter_runner": {
+      "atlas_max_context_len": 128,
+      "atlas_max_total_tokens": 4096,
+      "attention_backend_class": "FlashInferAttnBackend",
+      "eager_runner_class": "EagerRunner",
+      "model_runner_class": "ModelRunner",
+      "req_to_token_pool_class": "ReqToTokenPool",
+      "req_to_token_pool_context_capacity": 128,
+      "req_to_token_pool_shape": [
+        129,
+        128
+      ],
+      "server_attention_backend": "flashinfer",
+      "server_decode_attention_backend": "flashinfer",
+      "server_prefill_attention_backend": "flashinfer",
+      "token_to_kv_pool_allocator_class": "PagedTokenToKVPoolAllocator",
+      "token_to_kv_pool_class": "MHATokenToKVPool"
+    },
+    "forest_cancel_granularity": "between_decode_steps",
+    "k": 3,
+    "max_new_tokens": 8,
+    "rebuild_drafter_prefix_after_commit": false,
+    "rebuild_target_prefix_after_commit": false,
+    "system": "atlas_distributed_two_process",
+    "target_backend": "direct_flashinfer_full_llama_masked_verify",
+    "target_health": {
+      "metadata": {
+        "backend": "direct_flashinfer_full_llama_masked_verify",
+        "committed_prefix_length": 0,
+        "committed_verify_rounds": 0,
+        "custom_mask": true,
+        "deduplicated_tree_nodes": true,
+        "device": "cuda",
+        "dtype": "float16",
+        "flashinfer_version": "0.6.12",
+        "logits_aligned": null,
+        "model": "/workspace/models/Llama-3.2-1B",
+        "packed_custom_mask": false,
+        "page_size": 16,
+        "paged_kv": true,
+        "persistent_target_paged_kv": true,
+        "rope_applied": true,
+        "runtime_alignment_checked": false,
+        "semantic_correctness_required": true
+      },
+      "ok": true,
+      "service": "atlas_0709_target"
+    }
+  },
+  "prompt_token_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "rounds": [
+    {
+      "committed_kv_tokens": 4,
+      "committed_tokens": [
+        26061,
+        3,
+        4,
+        5
+      ],
+      "forest_depth": 4,
+      "handoff_mode": "completed_forest_reused",
+      "released_kv_pages": 0,
+      "released_route_rows": 9,
+      "remaining_tree_depth": 0,
+      "reused_stage2_depth": 4,
+      "reused_stage2_routes": 3,
+      "round_index": 0,
+      "selected_route_id": 11,
+      "target_prefix_len_after": 12,
+      "target_prefix_len_before": 8,
+      "target_scores": [
+        {
+          "draft_logprob": -9.204494714736938,
+          "route_id": 10,
+          "target_logprob": -20.380859375,
+          "token_ids": [
+            26061,
+            3,
+            4,
+            3
+          ]
+        },
+        {
+          "draft_logprob": -9.438869714736938,
+          "route_id": 11,
+          "target_logprob": -18.802734375,
+          "token_ids": [
+            26061,
+            3,
+            4,
+            5
+          ]
+        },
+        {
+          "draft_logprob": -9.485744714736938,
+          "route_id": 12,
+          "target_logprob": -20.849609375,
+          "token_ids": [
+            26061,
+            3,
+            4,
+            9
+          ]
+        }
+      ],
+      "target_unique_tree_nodes": 6,
+      "target_unmerged_path_nodes": 12,
+      "verify_returned_before_forest_done": false
+    },
+    {
+      "committed_kv_tokens": 0,
+      "committed_tokens": [
+        6,
+        31,
+        2,
+        4
+      ],
+      "forest_depth": 3,
+      "handoff_mode": "stopped",
+      "released_kv_pages": 0,
+      "released_route_rows": 0,
+      "remaining_tree_depth": 0,
+      "reused_stage2_depth": 0,
+      "reused_stage2_routes": 0,
+      "round_index": 1,
+      "selected_route_id": 46,
+      "target_prefix_len_after": 16,
+      "target_prefix_len_before": 12,
+      "target_scores": [
+        {
+          "draft_logprob": -16.81817376613617,
+          "route_id": 46,
+          "target_logprob": -8.980224609375,
+          "token_ids": [
+            6,
+            31,
+            2,
+            4
+          ]
+        },
+        {
+          "draft_logprob": -16.87125813961029,
+          "route_id": 47,
+          "target_logprob": -11.165771484375,
+          "token_ids": [
+            6,
+            31,
+            4,
+            3
+          ]
+        },
+        {
+          "draft_logprob": -17.13067376613617,
+          "route_id": 48,
+          "target_logprob": -9.667724609375,
+          "token_ids": [
+            6,
+            31,
+            2,
+            5
+          ]
+        }
+      ],
+      "target_unique_tree_nodes": 7,
+      "target_unmerged_path_nodes": 12,
+      "verify_returned_before_forest_done": true
+    }
+  ],
+  "text": "\"#$%&'()()*$%&'@#%",
+  "token_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    26061,
+    3,
+    4,
+    5,
+    6,
+    31,
+    2,
+    4
+  ]
+}
