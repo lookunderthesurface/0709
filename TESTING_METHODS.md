@@ -98,8 +98,9 @@ bash scripts/run_gsm8k_atlas_serial.sh
 ```
 
 It uses the same Target scoring and fallback flags, but its round order is
-strictly `build_tree -> verify -> commit/fallback -> rebuild_prefix`. It does
-not build forest, overlap RPC with Drafter work, or reuse stage-2 Drafter KV.
+strictly `build_tree -> verify -> commit/fallback -> reuse_prefix_kv`. It does
+not build forest, overlap Target work with Drafter work, or reuse stage-2
+Drafter KV. The committed Drafter prefix KV persists across rounds.
 Use `--backend atlas_serial` directly with `scripts/gsm8k_eval.py` if custom
 environment variables are not convenient.
 

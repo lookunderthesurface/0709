@@ -488,11 +488,13 @@ round:
 Drafter build tree (d steps)
     -> Target masked tree verify
     -> select or fallback AR
-    -> rebuild Drafter prefix
+    -> commit selected tokens into persistent Drafter KV
 ```
 
-It never builds forest, never overlaps Drafter and Target work, and does not
-reuse stage-2 Drafter KV across rounds. This is a quality-matched scheduling
+It never builds forest or overlaps Drafter and Target work. It preserves the
+committed Drafter prefix KV across rounds, but does not have stage-2 Drafter KV
+to reuse. Target fallback tokens are appended through the Drafter decode path
+without replaying the historical prefix. This is a quality-matched scheduling
 baseline, not the production asynchronous algorithm. Its throughput is the
 appropriate comparison for measuring whether the asynchronous implementation
 is slowed by single-GPU contention.

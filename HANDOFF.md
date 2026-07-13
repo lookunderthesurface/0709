@@ -94,9 +94,11 @@ forest and does not overlap work:
 Drafter build tree -> Target verify -> select/fallback -> next round
 ```
 
-The serial path uses the same weighted scoring and fallback settings as async,
-but does not reuse stage-2 Drafter KV across rounds. It is a benchmark baseline,
-not a replacement for the production async algorithm.
+The serial path uses the same weighted scoring and fallback settings as async.
+It preserves committed Drafter prefix KV across rounds, including by decoding
+known Target fallback tokens into that KV, but it does not build or reuse
+stage-2 Drafter KV. It is a benchmark baseline, not a replacement for the
+production async algorithm.
 
 The GSM8K serial launcher is now a single-process path: Drafter and Target are
 loaded by `gsm8k_eval.py`, Target verification is an in-process method call,
