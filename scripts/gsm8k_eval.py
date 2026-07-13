@@ -28,6 +28,32 @@ FINAL_ANSWER_RE = re.compile(r"####\s*([^\n\r]+)")
 NUMBER_RE = re.compile(r"[-+]?(?:\d[\d,]*\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
 
+def optional_float(value: str) -> float | None:
+    """Parse a float while allowing an explicit disabled value on the CLI."""
+    if value.strip().lower() in {"none", "off", "disabled"}:
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("value must be finite or one of: none, off, disabled")
+    return parsed
+
+
+def non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise argparse.ArgumentTypeError("value must be finite and non-negative")
+    return parsed
+
+
+def exponential_path_weights(depth: int, alpha: float) -> tuple[float, ...]:
+    """Return normalized w[i] = exp(-alpha * i), i in [0, depth)."""
+    if depth <= 0:
+        raise ValueError("depth must be positive")
+    raw = [math.exp(-alpha * index) for index in range(depth)]
+    total = math.fsum(raw)
+    return tuple(value / total for value in raw)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -279,8 +305,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--d", type=int, default=4)
     parser.add_argument("--fallback-ar-tokens", type=int, default=4)
     parser.add_argument("--path-score-weights", default="0.45,0.30,0.17,0.08")
-    parser.add_argument("--fallback-threshold", type=float, default=-0.50)
-    parser.add_argument("--first-token-threshold", type=float, default=-0.70)
+    parser.add_argument(
+        "--path-weight-alpha", type=non_negative_float,
+        help=(
+            "Use normalized exponential weights w[i]=exp(-alpha*i)/sum(w); "
+            "when set, this overrides --path-score-weights"
+        ),
+    )
+    parser.add_argument(
+        "--fallback-threshold", type=optional_float, default=-0.50,
+        help="Weighted path-score fallback threshold; use 'none' to disable this trigger",
+    )
+    parser.add_argument(
+        "--first-token-threshold", type=optional_float, default=-0.70,
+        help="First-token fallback threshold; use 'none' to disable this trigger",
+    )
     parser.add_argument("--target-workspace-mb", type=int, default=128)
     parser.add_argument("--use-packed-custom-mask", action="store_true")
     parser.add_argument("--target-timeout", type=float, default=600.0)
@@ -292,6 +331,9 @@ def main() -> int:
     for name in ("max_new_tokens", "context_length", "page_size", "prefill_chunk_size", "max_total_tokens", "k", "d"):
         if getattr(args, name) <= 0:
             raise SystemExit(f"--{name.replace('_', '-')} must be positive")
+    if args.path_weight_alpha is not None:
+        resolved_weights = exponential_path_weights(args.d, args.path_weight_alpha)
+        args.path_score_weights = ",".join(format(value, ".17g") for value in resolved_weights)
     examples = load_examples(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -430,7 +472,22 @@ def main() -> int:
                "settings": {"protocol": args.protocol, "num_fewshot": 8 if args.protocol == "llama-8shot" else 0,
                             "max_new_tokens": args.max_new_tokens, "strict_marker": args.strict_marker,
                             "k": args.k if args.backend.startswith("atlas") else None,
-                            "d": args.d if args.backend.startswith("atlas") else None}}
+                            "d": args.d if args.backend.startswith("atlas") else None,
+                            "path_score_weights": (
+                                args.path_score_weights if args.backend.startswith("atlas") else None
+                            ),
+                            "path_weight_alpha": (
+                                args.path_weight_alpha if args.backend.startswith("atlas") else None
+                            ),
+                            "fallback_threshold": (
+                                args.fallback_threshold if args.backend.startswith("atlas") else None
+                            ),
+                            "first_token_threshold": (
+                                args.first_token_threshold if args.backend.startswith("atlas") else None
+                            ),
+                            "fallback_ar_tokens": (
+                                args.fallback_ar_tokens if args.backend.startswith("atlas") else None
+                            )}}
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
     return 0
