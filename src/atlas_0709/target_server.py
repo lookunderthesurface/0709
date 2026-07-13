@@ -61,6 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Maximum number of greedy Target AR tokens to return on fallback.",
     )
+    parser.add_argument(
+        "--profile-fallback-ar",
+        action="store_true",
+        help=(
+            "Synchronize CUDA to report fallback wrapper setup, decode planning, and model-forward "
+            "times. Disabled by default because the synchronization changes production timing."
+        ),
+    )
     return parser
 
 
@@ -89,6 +97,7 @@ def main() -> int:
         fallback_threshold=args.fallback_threshold,
         first_token_threshold=args.first_token_threshold,
         fallback_ar_tokens=args.fallback_ar_tokens,
+        profile_fallback_ar=args.profile_fallback_ar,
     )
     serve_target(TargetServerApp(backend), host=args.host, port=args.port)
     return 0

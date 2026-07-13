@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Sequence
 
 import torch
@@ -14,9 +15,10 @@ from .flashinfer_full_verify import (
     ceil_div,
     dtype_from_name,
     load_model,
-    make_decode_wrappers,
+    make_decode_wrapper,
     make_prefill_wrapper,
     next_argmax_inputs,
+    plan_decode_wrapper,
     plan_prefill_wrapper,
     prefill_cache,
     run_flashinfer_full_ar_decode,
@@ -51,6 +53,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         fallback_threshold: float | None = None,
         first_token_threshold: float | None = None,
         fallback_ar_tokens: int = 4,
+        profile_fallback_ar: bool = False,
     ) -> None:
         config.validate()
         self.model_path = model_path
@@ -63,6 +66,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             None if first_token_threshold is None else float(first_token_threshold)
         )
         self.fallback_ar_tokens = int(fallback_ar_tokens)
+        self.profile_fallback_ar = bool(profile_fallback_ar)
         if self.fallback_ar_tokens <= 0:
             raise ValueError("fallback_ar_tokens must be positive")
         self.dtype = dtype_from_name(config.dtype)
@@ -76,6 +80,12 @@ class DirectFlashInferMaskedTreeVerifyBackend:
 
         self.flashinfer = flashinfer
         self._wrapper = make_prefill_wrapper(args=self.config, flashinfer=self.flashinfer)
+        # AR tokens are causally dependent, so their model forwards remain
+        # sequential. The FlashInfer decode wrapper and its workspace are not
+        # token-specific, however, and can be reused after replanning it for
+        # the new sequence length on every step.
+        self._fallback_decode_wrapper = None
+        self._last_fallback_ar_profile: dict[str, object] | None = None
         self.prefix_token_ids: tuple[int, ...] = ()
         self._paged_prefix_kv: list[torch.Tensor] | None = None
         self._prefix_logits: torch.Tensor | None = None
@@ -103,6 +113,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         self._paged_prefix_kv = paged_prefix_kv
         self._prefix_logits = prefix_logits.detach()
         self._committed_verify_rounds = 0
+        self._last_fallback_ar_profile = None
         return PrefixState(
             token_ids=token_ids,
             next_token_logits=self._prefix_logits[0],
@@ -219,6 +230,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
                         if selected.first_token_logprob is None
                         else float(selected.first_token_logprob)
                     ),
+                    "fallback_ar_profile": self._last_fallback_ar_profile,
                 },
             )
         selected_index = next(
@@ -272,6 +284,8 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             "fallback_threshold": self.fallback_threshold,
             "first_token_threshold": self.first_token_threshold,
             "fallback_ar_tokens": int(self.fallback_ar_tokens),
+            "fallback_decode_wrapper_reused": True,
+            "profile_fallback_ar": self.profile_fallback_ar,
             "committed_verify_rounds": self._committed_verify_rounds,
             "committed_prefix_length": len(self.prefix_token_ids),
         }
@@ -383,25 +397,53 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         self._ensure_page_capacity(required_pages)
         generated: list[int] = []
         input_ids = next_argmax_inputs(self._prefix_logits)
+        wrapper_was_cached = self._fallback_decode_wrapper is not None
+        profile = self.profile_fallback_ar
+        wrapper_setup_s = 0.0
+        plan_s = 0.0
+        model_s = 0.0
+        if profile:
+            self._synchronize_profile_clock()
+            setup_start = time.perf_counter()
+        if self._fallback_decode_wrapper is None:
+            self._fallback_decode_wrapper = make_decode_wrapper(
+                args=self.config,
+                flashinfer=self.flashinfer,
+            )
+        if profile:
+            self._synchronize_profile_clock()
+            wrapper_setup_s = time.perf_counter() - setup_start
+        wrapper = self._fallback_decode_wrapper
         for step_idx in range(max_tokens):
             token_id = int(input_ids.reshape(-1)[0].detach().cpu())
             generated.append(token_id)
-            wrappers = make_decode_wrappers(
+            if profile:
+                self._synchronize_profile_clock()
+                plan_start = time.perf_counter()
+            plan_decode_wrapper(
+                wrapper,
+                seq_len=prefix_len + step_idx + 1,
                 args=self.config,
                 config=self.model.config,
                 dtype=self.dtype,
-                flashinfer=self.flashinfer,
-                prefix_len=prefix_len + step_idx,
-                steps=1,
             )
+            if profile:
+                self._synchronize_profile_clock()
+                plan_s += time.perf_counter() - plan_start
             state = FullDecodeState(input_ids=input_ids, paged_prefix_kv=self._paged_prefix_kv)
+            if profile:
+                self._synchronize_profile_clock()
+                model_start = time.perf_counter()
             logits = run_flashinfer_full_ar_decode(
                 model=self.model,
-                wrappers=wrappers,
+                wrappers=[wrapper],
                 state=state,
                 prefix_len=prefix_len + step_idx,
                 page_size=self.config.page_size,
             )
+            if profile:
+                self._synchronize_profile_clock()
+                model_s += time.perf_counter() - model_start
             self._prefix_logits = logits.detach()
             if eos_token_id is not None and int(token_id) == int(eos_token_id):
                 break
@@ -411,7 +453,24 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             *(int(token_id) for token_id in generated),
         )
         self._committed_verify_rounds += 1
+        self._last_fallback_ar_profile = (
+            {
+                "enabled": True,
+                "wrapper_was_cached": wrapper_was_cached,
+                "wrapper_setup_seconds": wrapper_setup_s,
+                "decode_plan_seconds": plan_s,
+                "model_forward_seconds": model_s,
+                "token_count": len(generated),
+            }
+            if profile
+            else None
+        )
         return generated
+
+    def _synchronize_profile_clock(self) -> None:
+        device = torch.device(self.config.device)
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
 
     def _ensure_page_capacity(self, required_pages: int) -> None:
         if self._paged_prefix_kv is None:

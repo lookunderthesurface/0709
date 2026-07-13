@@ -83,6 +83,15 @@ multi-token SGLang EXTEND forward, and builds new stage-1 routes from the last
 EXTEND logits. It never re-prefills the historical prefix. Unselected forest
 routes are never reused after a fallback.
 
+Target AR remains four causally dependent one-token model forwards. Its
+FlashInfer decode wrapper and GPU workspace are created lazily once and reused;
+only the sequence-length-dependent decode plan is refreshed before each token.
+For diagnostic runs, add `--profile-fallback-ar` to the Target command. The
+fallback response then reports `wrapper_setup_seconds`,
+`decode_plan_seconds`, and `model_forward_seconds` under
+`metadata.fallback_ar_profile`. This flag is off by default because accurate
+phase separation inserts CUDA synchronizations and changes production timing.
+
 The current recommended configuration for `k=3, d=4` is:
 
 ```text
