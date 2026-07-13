@@ -28,6 +28,7 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
         committed = [int(token_id) for token_id in prompt_token_ids]
         generated: list[int] = []
         traces: list[DistributedRoundTrace] = []
+        target_fallback_ar_profiles: list[dict[str, object]] = []
         target_health = self.target_client.health()
 
         prefill_start = time.perf_counter()
@@ -79,6 +80,11 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
             verify_elapsed_s = time.perf_counter() - verify_start
             target_elapsed_s += verify_elapsed_s
             target_verify_metadata = dict(verify_response.get("metadata", {}))
+            fallback_ar_profile = target_verify_metadata.get("fallback_ar_profile")
+            if isinstance(fallback_ar_profile, dict):
+                target_fallback_ar_profiles.append(
+                    {"round_index": round_index, **fallback_ar_profile}
+                )
             decision = str(verify_response.get("decision", "select"))
 
             selected_route_id: int | None = None
@@ -231,6 +237,7 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                 "fallback_rounds": fallback_rounds,
                 "fallback_rate": fallback_rounds / len(traces) if traces else None,
                 "fallback_drafter_append_mode": "single_multi_token_extend",
+                "target_fallback_ar_profiles": target_fallback_ar_profiles,
                 "fallback_appended_tokens": fallback_appended_tokens,
                 "fallback_append_elapsed_s": fallback_append_elapsed_s,
                 "fallback_append_tokens_per_second": (
