@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -122,7 +123,7 @@ def encode_prompt(tokenizer: Any, prompt: str) -> list[int]:
             f"User: {prompt}\nAssistant:",
             add_special_tokens=True,
         )
-    if isinstance(encoded, dict):
+    if isinstance(encoded, Mapping):
         encoded = encoded["input_ids"]
     if hasattr(encoded, "tolist"):
         encoded = encoded.tolist()
