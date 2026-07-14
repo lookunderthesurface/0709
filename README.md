@@ -740,11 +740,15 @@ token-by-token greedy path. The diagnostic compares exact token IDs against
 `FlashInferPagedGreedyARGenerator` under the live forest schedule. Optional
 integer forest depths can still be checked independently to localize a failure.
 It also enables per-round coordinator/Drafter/Target prefix, physical slot-path,
-and request-row assertions. The production default remains Target best-path
-selection with wall-clock-controlled forest completion. The JSON also reports
-the observed forest-depth trajectory and how many distinct live trajectories
-occurred; identical outputs from two identical trajectories alone are replay
-evidence, not evidence that different scheduling boundaries were exercised.
+page-layout/live-ownership, and request-row assertions. A logical KV node can
+legitimately have multiple physical slots after tail-page copy-on-write, so the
+validation treats the route-local path and req row as physical truth; the
+node's first materialization slot is provenance, not a unique mapping. The
+production default remains Target best-path selection with wall-clock-controlled
+forest completion. The JSON also reports the observed forest-depth trajectory
+and how many distinct live trajectories occurred; identical outputs from two
+identical trajectories alone are replay evidence, not evidence that different
+scheduling boundaries were exercised.
 
 Real Drafter route-KV alignment check with normal 16-token pages:
 

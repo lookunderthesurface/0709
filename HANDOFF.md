@@ -1379,8 +1379,11 @@ the default production selection or scheduler:
   boundary from diagnostic replay experiments; depths `0..d` can be tested
   separately. It is not required for generation-level reproducibility.
 - `--validate-state-alignment` checks coordinator, Drafter logical prefix,
-  physical prefix slots, route node-to-slot mappings, and available req rows
-  after every active handoff.
+  physical prefix slots, route-local path length/page layout/live ownership,
+  and available req rows after every active handoff. It does not require a
+  logical node's route slot to equal its first materialization slot: tail-page
+  COW intentionally creates physical aliases, and the original page can later
+  be released.
 - The Edge now sends `selected_path_max_tokens`; Target applies the same output
   budget/EOS truncation before committing KV. Previously the terminal Target
   cache could contain the unused tail of a full `d`-token route.
@@ -1523,3 +1526,59 @@ lossless and relaxed/beam baselines, multiple model/task pairs, real separated
 Edge/Cloud hardware, RTT/jitter/concurrency/SLO sweeps, and ablation of route
 policy, forest policy, and physical KV reuse. Do not turn the instrumentation
 itself into the claimed contribution.
+
+### Herta validation and paired pilot at `19b1a68`
+
+The first real `k=3,target_sample` replay exposed a false validation invariant,
+not a generation failure. `node_slot_ids` records a node's first/canonical
+slot, while partial-tail COW can copy that logical KV to a route-private page.
+Pruning may then release the canonical page. Exact route-slot equality against
+that single canonical slot was therefore invalid. The replacement validator
+keeps the strong invariants that do hold: logical/physical path length, paged
+layout, live page ownership, materialization coverage, req-row length, and
+req-row/path equality. A regression explicitly covers a live private COW page
+after the canonical page is gone. Herta passed all **72/72** dependency-free
+test functions plus `compileall` and `git diff --check`.
+
+The real H800 sampled replay used `k=3,d=4`, Drafter temperature `0.8`, request
+seed `20260715`, Target route temperature `1.0`, weighted Target path scores,
+normal live forest timing, and per-round state validation. Two fresh Edge
+processes produced the same 64 tokens, selected route IDs, and route-sampling
+CDF records. The generated-token SHA256 was
+`01ef549fd1c3296739885e1f5c64cba6ea8290cd30d928380c23b2af2d447160`.
+Target selected away from route 0 in 12/16 rounds; selected Drafter ranks were
+1/2/3 in 4/5/7 rounds. The smallest recorded sampling-boundary margin was
+`0.0065504423`. Both runs happened to complete forest depth 4 in every round,
+so this is exact replay under the observed live trajectory, not new evidence
+for two different hardware timing boundaries.
+
+A scheduling-independent, fallback-disabled GSM8K pilot paired
+`target_best` against `first_route` on the same first 32 test examples, exact
+prompt-token hashes, per-example seeds, sampled Drafter proposals, and
+512-token budget. Results were:
+
+```text
+target_best: 20/32 = 62.5%
+first_route: 16/32 = 50.0%
+helped / hurt / net: 5 / 1 / +4 answers (+12.5 percentage points)
+exact two-sided McNemar p: 0.21875
+
+Target action rounds:                   238 / 847 = 28.1%
+selected Drafter rank 1 / 2 / 3:        609 / 166 / 72
+lower whole-path Drafter probability:   237 rounds
+lower first-token Drafter probability:   44 rounds
+first token changed:                     64 rounds
+samples with at least one intervention:  32 / 32
+```
+
+This pilot proves the mechanism is active and gives a promising quality
+direction, but it is not a paper result: 32 samples yield a non-significant
+paired test. Tune only on a development split, freeze the policy, then run the
+full 1,319-example test set across multiple seeds/model pairs before claiming
+quality improvement. Artifacts:
+
+```text
+/home/hwc/workspace/0701/0709_outputs/sampling_intervention_19b1a68_20260714T175614Z/dependency_free_tests.log
+/home/hwc/workspace/0701/0709_outputs/sampling_intervention_19b1a68_20260714T175614Z/target_sample_live_replay/replay_comparison.json
+/home/hwc/workspace/0701/0709_outputs/sampling_intervention_19b1a68_20260714T175614Z/gsm8k_paired_pilot32/paired_intervention_report.json
+```
