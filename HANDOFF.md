@@ -117,6 +117,17 @@ ms. This only
 predicts full hiding for total added RTT/overhead within that margin on this
 proxy. A weak real Edge may provide a larger forest window.
 
+A real two-process, one-H800 async regression test also confirms that the
+Drafter forest path became faster, while exposing the expected same-GPU
+contention. Against the pre-hot-path source, matched forest depth 1 and depth 2
+steps were 16.24% and 24.97% faster. The Edge completed three rather than two
+forest depths per round, and the fixed 128-token timeline was 7.78% shorter.
+On 87 strictly matched GSM8K examples, default async E2E time was 5.75% lower
+per round. Target black-box time was nevertheless 5.92% higher, consistent
+with the faster Edge occupying the same GPU more aggressively. This is an
+implementation regression result, not a deployed Edge--Cloud overlap claim;
+see Section 3.
+
 The serial GSM8K 100-example screen showed a real candidate quality--speed
 signal, mostly controlled by fallback:
 
@@ -735,6 +746,99 @@ queue, Target verify, Target KV commit, and response wait. It does not use a
 Target-internal duration as the Cloud interval. Green blocks are individual
 forest depths; blue blocks are post-prune build-tree depths; a visible gap
 between blocks means separate token steps.
+
+### 2026-07-14 single-H800 async regression test
+
+This test deliberately ran the real two-process async implementation on one
+H800: an 8B Target HTTP server and a 1B Drafter/coordinator both used GPU 0.
+It is useful for implementation and scheduling regression detection, but the
+two models contend for the same GPU and it is not a proxy for independent Edge
+and Cloud accelerators.
+
+The controlled forest A/B kept one current no-fallback Target server fixed and
+alternated three fresh Edge processes per arm in A/B/B/A/A/B order. Arm A was
+`981f5c2`; its `src/atlas_0709` tree is identical to the historical async
+artifact commit `e7eeefd`. Arm B was current `a920912`. Every process used a
+4,096-token repeated prefix, 128 generated tokens, exactly 32 rounds, no EOS,
+`k=3`, `d=4`, FP16, page size 16, context 8192, one warmup, and the same
+localhost Target. Raw `timeline.json` forest spans are valid step wall times:
+the candidate D2H at each step boundary synchronizes Drafter CUDA work.
+
+The fair comparison is per depth. Total forest time is not comparable because
+the faster arm completes more depths before the Target response arrives.
+
+| Actual async forest step | Pre-hot-path mean +/- SD, n=3 | Current mean +/- SD, n=3 | Latency change |
+|---|---:|---:|---:|
+| Depth 1 | 13.519610 +/- 0.974974 ms | 11.323960 +/- 0.030652 ms | -16.2405% |
+| Depth 2 | 27.374190 +/- 0.146920 ms | 20.540105 +/- 0.147599 ms | -24.9654% |
+
+There is no matched old depth-3/depth-4 sample: the old Target response almost
+always stopped the forest after depth 2. The realized scheduling result was:
+
+| Fixed 128-token async workload | Pre-hot-path mean +/- SD, n=3 | Current mean +/- SD, n=3 | Change |
+|---|---:|---:|---:|
+| Forest depths completed per round | 2.0000 +/- 0 | 3.0000 +/- 0 | +1 depth |
+| Post-prune tree steps per round | 1.9375 +/- 0 | 0.96875 +/- 0 | approximately halved |
+| Target verify black-box | 34.651784 +/- 0.748543 ms/round | 38.636421 +/- 0.039999 ms/round | +11.4991% |
+| Edge timeline | 63.503402 +/- 0.203521 ms/round | 58.560619 +/- 0.040492 ms/round | -7.7835% |
+| Edge timeline throughput | 62.989182 +/- 0.201504 tok/s | 68.305310 +/- 0.047241 tok/s | +8.4397% |
+
+All old rounds returned before a full forest; current completed a full forest
+in one of 32 rounds per process and otherwise usually reached depth 3. The
+post-prune tree step itself was essentially unchanged (7.043994 versus
+7.171059 ms), but only half as many were needed. Initial tree time is omitted:
+it overlaps same-GPU Target prompt prefill and had large order-dependent
+variance. Generated length, round count, and physical shapes were fixed, but
+token outputs were not identical across arms; async control is wall-clock
+dependent because the completed forest depth changes the handoff state.
+
+The operational default was also rerun on GSM8K examples 0--99 with the
+historical settings: weights `0.45,0.30,0.17,0.08`, fallback -0.5,
+first-token -0.7, AR4, max-new 512, context/prefill 4096, page 16, FP16,
+memory fraction 0.75, 32 requests, 32768 tokens, and one warmup. The old
+single run is confirmed as `e7eeefd`; current is the mean of two `a920912`
+runs, whose observable responses, token counts, and round counts reproduced
+exactly.
+
+Full trajectories drifted from 11,368 tokens / 2,880 rounds / 86% EM to
+11,632 / 2,946 / 85% EM. The primary comparison therefore uses the 87 examples
+whose response strings, generated-token counts, and round counts match old and
+both current runs exactly: 9,737 tokens and 2,467 rounds on each side.
+
+| Strictly matched default async, 87 examples | Old single run | Current mean +/- sample SD, n=2 | Change |
+|---|---:|---:|---:|
+| E2E time | 72.356745 ms/round | 68.193085 +/- 0.316992 ms/round | -5.7541% |
+| E2E throughput | 54.547770 tok/s | 57.878914 +/- 0.269047 tok/s | +6.1069% |
+| Edge timeline | 72.291850 ms/round | 68.128032 +/- 0.315522 ms/round | -5.7598% |
+| Target verify black-box | 44.056417 ms/round | 46.665391 +/- 0.022246 ms/round | +5.9224% |
+| Cloud/forest overlap | 43.098149 ms/round | 41.195650 +/- 0.025827 ms/round | -4.4143% |
+| Exposed cloud wait | 0.000681 ms/round | 4.703310 +/- 0.015731 ms/round | +4.702628 ms |
+
+On all 100 examples, current E2E was 68.249555 +/- 0.316807 ms/round and
+57.853083 +/- 0.268548 tok/s, versus old 72.691091 ms/round and 54.301320
+tok/s. Do not use that full result as a same-work model-only comparison because
+13 response strings changed. The matched and full results agree that forest
+acceleration reaches system E2E, while same-GPU Target slowdown and exposed
+wait consume part of the gain. On separate Edge/Cloud devices the contention
+term should differ and must be measured rather than inferred.
+
+The Cloud interval is an Edge-observed black box containing thread scheduling,
+JSON, localhost HTTP, Target queueing, verify, and response. Target scoring
+synchronizes its main forward, but the final Target KV commit/fallback forward
+still lacks an explicit tail synchronization. Treat the direct forest spans as
+the clean Drafter evidence and the total timeline as the one-GPU system result;
+do not turn the split into a publication-grade hardware attribution.
+
+Artifacts:
+
+```text
+controlled A/B root: /home/hwc/workspace/0701/0709_outputs/async_ab_981f5c2_a920912/controlled
+  old_run1 .. old_run3/{result.json,timeline.json,console.log}
+  current_run1 .. current_run3/{result.json,timeline.json,console.log}
+old GSM8K: /home/hwc/workspace/0701/0709_outputs/gsm8k_async_wrapper_reuse
+current GSM8K: /home/hwc/workspace/0701/0709_outputs/async_ab_981f5c2_a920912/gsm8k_default
+  current_run1, current_run2
+```
 
 ## 4. Quality Controls
 
