@@ -8,6 +8,7 @@ from typing import Any, Protocol, Sequence
 import torch
 
 from .kv import KVTreeStore
+from .sampling import DrafterSamplingContext, batch_parent_token_candidates
 from .types import (
     DecodePhase,
     FrontierDecodeOutput,
@@ -129,6 +130,8 @@ def build_pending_candidate_batch(
     next_token_logits: torch.Tensor,
     *,
     k: int,
+    sampling: DrafterSamplingContext | None = None,
+    relative_parent_paths: Sequence[Sequence[int]] | None = None,
 ) -> PendingCandidateBatch:
     if len(decoded_routes) != int(next_token_logits.shape[0]):
         raise ValueError(
@@ -137,12 +140,15 @@ def build_pending_candidate_batch(
     if k <= 0:
         raise ValueError("k must be positive")
 
-    actual_k = min(int(k), int(next_token_logits.shape[-1]))
-    token_logprobs, token_ids = torch.topk(
-        torch.log_softmax(next_token_logits, dim=-1),
-        k=actual_k,
-        dim=-1,
+    if relative_parent_paths is None:
+        relative_parent_paths = tuple(() for _ in decoded_routes)
+    token_logprobs, token_ids = batch_parent_token_candidates(
+        next_token_logits,
+        k=k,
+        sampling=sampling,
+        relative_parent_paths=relative_parent_paths,
     )
+    actual_k = int(token_ids.shape[-1])
     device = next_token_logits.device
     batch_size = len(decoded_routes)
     parent_route_ids = torch.tensor(
@@ -332,6 +338,7 @@ def advance_frontier_one_token(
     model_backend: FrontierModelBackend,
     selection_policy: SelectionPolicy,
     attention_backend: Any = None,
+    sampling: DrafterSamplingContext | None = None,
 ) -> FrontierStepOutput:
     """Decode one frontier depth and materialize its GPU selection once."""
 
@@ -349,6 +356,10 @@ def advance_frontier_one_token(
         active_routes,
         decode_output.next_token_logits,
         k=k,
+        sampling=sampling,
+        relative_parent_paths=[
+            route_store.pending_token_path(route) for route in active_routes
+        ],
     )
     selected_indices = selection_policy.select_indices(
         candidate_batch,

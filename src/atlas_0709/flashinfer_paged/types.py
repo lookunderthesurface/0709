@@ -60,6 +60,11 @@ class RouteState:
     stage1_depth: int
     stage2_depth: int
     kv_view: RouteKVView
+    # Per-token Drafter model log probabilities for this route relative to
+    # the current committed prefix.  A frontier route includes its pending
+    # token; a completed/materialized route contains exactly its materialized
+    # path.  The tuple is split/pruned together with the token path.
+    token_logprobs: tuple[float, ...] = ()
 
     def total_materialized_depth(self) -> int:
         return self.stage1_depth + self.stage2_depth

@@ -195,9 +195,26 @@ def create_ar(args: argparse.Namespace):
     )
     eos = stop_token_id(tokenizer, args.eos_token_id)
 
-    def generate(prompt_ids: Sequence[int], max_new_tokens: int | None = None):
-        result = generator.generate(prompt_ids, max_new_tokens=max_new_tokens or args.max_new_tokens, eos_token_id=eos)
-        return result.generated_token_ids, {"finish_reason": result.finish_reason, "backend": result.metadata}
+    def generate(
+        prompt_ids: Sequence[int],
+        max_new_tokens: int | None = None,
+        *,
+        generation_seed: int | None = None,
+    ):
+        request_seed = args.generation_seed if generation_seed is None else int(generation_seed)
+        result = generator.generate(
+            prompt_ids,
+            max_new_tokens=max_new_tokens or args.max_new_tokens,
+            eos_token_id=eos,
+            do_sample=args.drafter_do_sample,
+            generation_seed=request_seed,
+            temperature=args.drafter_temperature,
+        )
+        return result.generated_token_ids, {
+            "finish_reason": result.finish_reason,
+            "generation_seed": request_seed,
+            "backend": result.metadata,
+        }
 
     return tokenizer, generate, runner
 
@@ -205,6 +222,7 @@ def create_ar(args: argparse.Namespace):
 def create_atlas(args: argparse.Namespace, *, serial: bool = False):
     from transformers import AutoTokenizer
     from atlas_0709.distributed_system import DistributedAtlasConfig, PagedDistributedAtlasGenerator
+    from atlas_0709.eval_interventions import summarize_generation_interventions
     from atlas_0709.flashinfer_paged.sglang_runtime import SGLangRunnerConfig, create_sglang_model_runner
     from atlas_0709.rpc import InProcessTargetClient, RemoteTargetClient
 
@@ -240,6 +258,7 @@ def create_atlas(args: argparse.Namespace, *, serial: bool = False):
                 first_token_threshold=args.first_token_threshold,
                 fallback_ar_tokens=args.fallback_ar_tokens,
                 route_selection_policy=args.route_selection_policy,
+                route_sampling_temperature=args.route_sampling_temperature,
             )
         )
     else:
@@ -254,7 +273,13 @@ def create_atlas(args: argparse.Namespace, *, serial: bool = False):
     ), initialize=True)
     eos = stop_token_id(tokenizer, args.eos_token_id)
 
-    def generate(prompt_ids: Sequence[int], max_new_tokens: int | None = None):
+    def generate(
+        prompt_ids: Sequence[int],
+        max_new_tokens: int | None = None,
+        *,
+        generation_seed: int | None = None,
+    ):
+        request_seed = args.generation_seed if generation_seed is None else int(generation_seed)
         generator = atlas_generator_class(
             config=DistributedAtlasConfig(
                 k=args.k,
@@ -262,6 +287,9 @@ def create_atlas(args: argparse.Namespace, *, serial: bool = False):
                 max_new_tokens=max_new_tokens or args.max_new_tokens,
                 eos_token_id=eos,
                 fallback_ar_tokens=args.fallback_ar_tokens,
+                generation_seed=request_seed,
+                drafter_do_sample=args.drafter_do_sample,
+                drafter_temperature=args.drafter_temperature,
                 fixed_forest_depth=args.fixed_forest_depth,
                 validate_state_alignment=args.validate_state_alignment,
             ),
@@ -271,9 +299,11 @@ def create_atlas(args: argparse.Namespace, *, serial: bool = False):
         result = generator.generate(prompt_ids)
         return result.generated_token_ids, {
             "rounds": len(result.rounds),
+            "generation_seed": request_seed,
             "target_health": health,
             "execution_mode": result.metadata.get("execution_mode", "async_distributed"),
             "generator_metadata": result.metadata,
+            "target_intervention": summarize_generation_interventions(result.rounds),
         }
 
     return tokenizer, generate, runner
@@ -326,6 +356,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Assert cross-model prefix invariants after every active ATLAS handoff.",
     )
     parser.add_argument("--fallback-ar-tokens", type=int, default=4)
+    parser.add_argument(
+        "--generation-seed",
+        type=int,
+        default=0,
+        help=(
+            "Base seed; each request uses generation_seed + GSM8K index and "
+            "records the resolved value in predictions.jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--drafter-do-sample",
+        action="store_true",
+        help="Use semantic-prefix seeded Drafter candidate sampling.",
+    )
+    parser.add_argument(
+        "--drafter-temperature",
+        type=float,
+        default=1.0,
+        help="Proposal temperature for --drafter-do-sample.",
+    )
     parser.add_argument("--path-score-weights", default="0.45,0.30,0.17,0.08")
     parser.add_argument(
         "--path-weight-alpha", type=non_negative_float,
@@ -346,11 +396,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-packed-custom-mask", action="store_true")
     parser.add_argument(
         "--route-selection-policy",
-        choices=["target_best", "first_route"],
+        choices=["target_best", "target_sample", "first_route"],
         default="target_best",
         help=(
             "Target route policy for atlas_serial. For remote atlas runs this is "
             "configured on the Target server and recorded from /health."
+        ),
+    )
+    parser.add_argument(
+        "--route-sampling-temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Route-level Target temperature for atlas_serial target_sample; "
+            "remote atlas uses the Target server setting."
         ),
     )
     parser.add_argument("--target-timeout", type=float, default=600.0)
@@ -365,6 +424,10 @@ def main() -> int:
     if args.path_weight_alpha is not None:
         resolved_weights = exponential_path_weights(args.d, args.path_weight_alpha)
         args.path_score_weights = ",".join(format(value, ".17g") for value in resolved_weights)
+    if not math.isfinite(args.drafter_temperature) or args.drafter_temperature <= 0.0:
+        raise SystemExit("--drafter-temperature must be finite and positive")
+    if not math.isfinite(args.route_sampling_temperature) or args.route_sampling_temperature <= 0.0:
+        raise SystemExit("--route-sampling-temperature must be finite and positive")
     examples = load_examples(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -386,7 +449,11 @@ def main() -> int:
         tokenizer, generate, runner = create_atlas(args)
     warmup_ids = chat_token_ids(tokenizer, "Jan has 2 apples and buys 3 more. How many apples?", args)
     for _ in range(args.warmup_runs):
-        generate(warmup_ids, min(32, args.max_new_tokens))
+        generate(
+            warmup_ids,
+            min(32, args.max_new_tokens),
+            generation_seed=args.generation_seed,
+        )
     torch.cuda.synchronize()
 
     try:
@@ -401,8 +468,12 @@ def main() -> int:
                 prompt_ids = chat_token_ids(tokenizer, example["question"], args)
                 if len(prompt_ids) + args.max_new_tokens > args.context_length:
                     raise RuntimeError("prompt plus generation exceeds context length")
+                request_seed = int(args.generation_seed) + int(index)
                 started = time.perf_counter()
-                generated_ids, metadata = generate(prompt_ids)
+                generated_ids, metadata = generate(
+                    prompt_ids,
+                    generation_seed=request_seed,
+                )
                 torch.cuda.synchronize()
                 elapsed = time.perf_counter() - started
                 text = tokenizer.decode(generated_ids, skip_special_tokens=True,
@@ -412,9 +483,14 @@ def main() -> int:
                        "question": example["question"], "gold": gold, "prediction": prediction,
                        "correct": prediction == gold, "response": text,
                        "prompt_tokens": len(prompt_ids), "generated_tokens": len(generated_ids),
+                       "generation_seed": request_seed,
                        "elapsed_s": elapsed,
                        "tokens_per_second": len(generated_ids) / elapsed if elapsed else None,
                        "metadata": metadata, "created_at": utc_now()}
+                if isinstance(metadata.get("target_intervention"), Mapping):
+                    # Keep this at top level for paired/offline analysis while
+                    # retaining the metadata copy for backward-compatible readers.
+                    row["target_intervention"] = metadata["target_intervention"]
                 append_jsonl(predictions_path, row)
                 print(f"[{offset + 1}/{len(examples)}] index={index} pred={prediction} gold={gold} "
                       f"correct={row['correct']} tokens={len(generated_ids)}", flush=True)
@@ -466,6 +542,11 @@ def main() -> int:
     )
 
     correct = sum(bool(row["correct"]) for row in rows)
+    target_intervention_summary = None
+    if args.backend.startswith("atlas"):
+        from atlas_0709.eval_interventions import aggregate_prediction_interventions
+
+        target_intervention_summary = aggregate_prediction_interventions(rows)
     total_generated_tokens = sum(int(row.get("generated_tokens", 0)) for row in rows)
     total_elapsed_s = sum(float(row.get("elapsed_s", 0.0)) for row in rows)
     summary = {"backend": args.backend, "model": args.model, "data_file": args.data_file,
@@ -477,6 +558,7 @@ def main() -> int:
                "end_to_end_tokens_per_second": (
                    total_generated_tokens / total_elapsed_s if total_elapsed_s else None
                ),
+               "target_intervention": target_intervention_summary,
                "serial_speed": ({
                    "generated_tokens": serial_tokens,
                    "rounds": serial_rounds,
@@ -522,8 +604,17 @@ def main() -> int:
                              "fallback_ar_tokens": (
                                  args.fallback_ar_tokens if args.backend.startswith("atlas") else None
                              ),
+                             "generation_seed": args.generation_seed,
+                             "request_seed_rule": "generation_seed_plus_gsm8k_index",
+                             "drafter_do_sample": args.drafter_do_sample,
+                             "drafter_temperature": args.drafter_temperature,
                              "route_selection_policy": (
                                  args.route_selection_policy if args.backend.startswith("atlas") else None
+                             ),
+                             "route_sampling_temperature": (
+                                 args.route_sampling_temperature
+                                 if args.backend == "atlas_serial"
+                                 else None
                              )}}
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)

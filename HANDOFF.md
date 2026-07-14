@@ -38,10 +38,12 @@ PicoSpec (arXiv:2603.19133), which already presents an asynchronous pipelined
 collaborative SD system, and *Speculation at a Distance*
 (arXiv:2606.25091), which argues that WAN single-request latency gains occupy a
 narrow regime and that multi-tenant capacity may be the stronger distributed
-claim. Do not claim that 0709 is the first dynamic, asynchronous, or
-Edge--Cloud speculative tree. Differentiate it through deadline-aware
-interruptible forest construction, the persistent physical KV lifecycle, and
-measured SLO/capacity tradeoffs.
+claim. SSD/Saguaro (arXiv:2603.03251) also studies asynchronous speculation and
+verification on separate hardware. Do not claim that 0709 is the first
+dynamic, asynchronous, separate-hardware, or Edge--Cloud speculative tree.
+Differentiate it through Target-guided relaxed best-of-N path selection,
+deadline-aware interruptible forest construction, the persistent physical KV
+lifecycle, and measured quality/SLO/capacity tradeoffs.
 
 CUDA Graph, synchronization removal, route-row/page-table cleanup, and cheaper
 tail-page COW remain important **engineering enablers and fairness controls**.
@@ -1374,7 +1376,8 @@ the default production selection or scheduler:
 - Target `--route-selection-policy first_route` scores every input path but
   commits the first payload route. It rejects enabled fallback thresholds.
 - `DistributedAtlasConfig.fixed_forest_depth` removes the Target wall-clock
-  boundary from replay experiments; depths `0..d` can be tested separately.
+  boundary from diagnostic replay experiments; depths `0..d` can be tested
+  separately. It is not required for generation-level reproducibility.
 - `--validate-state-alignment` checks coordinator, Drafter logical prefix,
   physical prefix slots, route node-to-slot mappings, and available req rows
   after every active handoff.
@@ -1445,3 +1448,76 @@ shows a meaningful quality/latency/GPU-work Pareto gap over the best fixed
 policy. A main-paper result also needs multiple model pairs, real separated
 Edge/Cloud hardware, RTT/jitter/queue sweeps, full tasks, strong sync/async tree
 baselines, ablations, and paired confidence intervals.
+
+## 13. Seeded Sampling and Target-Intervention Audit (2026-07-15)
+
+The generation reproducibility contract is now independent of forest depth.
+For each Drafter parent, proposal RNG is keyed by `generation_seed` plus the
+complete semantic token prefix. Route/request-row allocation, batching order,
+tree versus forest execution, and unused work completed before the Target
+response do not advance a shared random stream. GSM8K resolves each request as
+`base_generation_seed + example_index` and records the resolved seed. Use the
+normal live wall-clock forest schedule for the main repeatability experiment;
+use `fixed_forest_depth=0..d` only to isolate a scheduling/KV boundary during
+debugging. Same-seed replay is scoped to the same software/hardware stack, not
+claimed as cross-stack bitwise equivalence near sampling CDF boundaries.
+
+Sampling scopes must be named precisely:
+
+- `--drafter-do-sample --drafter-temperature T` samples each Drafter parent's
+  candidate set without replacement. Independent paged AR and `k=1` ATLAS use
+  the same semantic-prefix RNG for the sampled equivalence check.
+- Target `--route-selection-policy target_sample` samples **after verify** from
+  a temperature-scaled softmax over verified route selection scores. Canonical
+  semantic route ordering plus explicit generation seed/round make that route
+  decision replayable. This is route-level sampling, not Target-token sampling.
+- Target fallback AR remains greedy. Do not describe a `target_sample` run as
+  fully token-sampled Target decoding.
+
+The GSM8K evaluator now writes per-sample and aggregate Target-intervention
+statistics. Keep two references separate: selection away from `first_route`
+(plus fallback) is the causal Target-action count, while selection away from
+the Drafter's highest current-prefix path measures probability displacement.
+It reports both, plus first-token changes, lower Drafter first-token or
+whole-path probability, the selected Drafter-rank histogram, fallbacks, and
+metric coverage. Do not substitute the legacy cumulative beam score after
+forest promotion: it can contain a prefix constant that is outside the current
+decision.
+
+Quality attribution requires two aligned runs, `target_best` and
+`first_route`, with identical sample indices/content, models, token budget,
+Drafter sampling configuration, and generation seeds. Disable both fallback
+thresholds when isolating route selection. Then run:
+
+```bash
+python tools/compare_gsm8k_target_intervention.py \
+  --target-best ../0709_outputs/<target_best_run> \
+  --first-route ../0709_outputs/<first_route_run> \
+  --json-out ../0709_outputs/<paired_intervention_report>.json
+```
+
+The paired final-answer quantities are `helped`, `hurt`, net correct gain,
+response changes, and the exact two-sided McNemar p-value, including impacts
+conditioned on recorded intervention types. Treat the final answer as the
+causal unit: after the first different committed token, subsequent round
+boundaries and candidate sets intentionally diverge and cannot be paired
+round-by-round.
+
+Paper positioning must remain conservative. PicoSpec already explicitly
+claims asynchronous Edge--Cloud collaborative inference, SSD/Saguaro already
+covers asynchronous speculation/verification on separate devices, and PipeSD
+(arXiv:2605.13319, ICML 2026) already combines a Cloud--Edge pipeline with
+adaptive verification triggering. Quality-improving multi-path decoding is
+also not empty prior-art territory: Dynamic-Width Speculative Beam Decoding
+(arXiv:2409.16560) verifies draft forests while preserving a Target beam-
+sampling distribution. ATLAS therefore cannot rely on any of those phrases in
+isolation as novelty. The testable combined hypothesis is **Target-guided
+relaxed whole-path selection under an asynchronous Edge--Cloud deadline**,
+implemented by an interruptible anytime forest and a real paged-KV
+cancel/promote/reuse lifecycle. Reaching a top systems venue still requires
+evidence that this precise combination creates a new quality--latency--Cloud-
+work Pareto frontier: paired quality gains with help/hurt attribution, strong
+lossless and relaxed/beam baselines, multiple model/task pairs, real separated
+Edge/Cloud hardware, RTT/jitter/concurrency/SLO sweeps, and ablation of route
+policy, forest policy, and physical KV reuse. Do not turn the instrumentation
+itself into the claimed contribution.

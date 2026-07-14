@@ -7,6 +7,7 @@ import torch
 
 from .flashinfer_paged.builders import build_tree_one_depth, initialize_stage1_routes
 from .flashinfer_paged.kv import KVTreeStore
+from .flashinfer_paged.sampling import DrafterSamplingConfig, DrafterSamplingContext
 from .flashinfer_paged.sglang_runtime import (
     SGLangFlashInferFrontierModelBackend,
     prefill_sglang_prefix,
@@ -22,7 +23,7 @@ class FlashInferARResult:
 
 
 class FlashInferPagedGreedyARGenerator:
-    """Strict batch-1 greedy AR over SGLang's FlashInfer paged KV runtime."""
+    """Batch-1 greedy or reproducibly sampled AR over FlashInfer paged KV."""
 
     def __init__(
         self,
@@ -42,11 +43,24 @@ class FlashInferPagedGreedyARGenerator:
         *,
         max_new_tokens: int,
         eos_token_id: int | None,
+        do_sample: bool = False,
+        generation_seed: int = 0,
+        temperature: float = 1.0,
     ) -> FlashInferARResult:
         if not prompt_token_ids:
             raise ValueError("prompt_token_ids cannot be empty")
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
+
+        sampling_config = DrafterSamplingConfig(
+            do_sample=bool(do_sample),
+            seed=int(generation_seed),
+            temperature=float(temperature),
+        )
+        sampling = DrafterSamplingContext(
+            config=sampling_config,
+            committed_token_ids=tuple(int(token_id) for token_id in prompt_token_ids),
+        )
 
         store = KVTreeStore()
         backend = SGLangFlashInferFrontierModelBackend.from_runner(
@@ -67,7 +81,12 @@ class FlashInferPagedGreedyARGenerator:
             prefix_slot_ids=prefill.prefix_slot_ids,
             next_token_logits=prefill.next_token_logits,
         )
-        routes = initialize_stage1_routes(prefix, k=1, route_store=store)
+        routes = initialize_stage1_routes(
+            prefix,
+            k=1,
+            route_store=store,
+            sampling=sampling,
+        )
         generated: list[int] = []
         finish_reason = "length"
 
@@ -84,6 +103,7 @@ class FlashInferPagedGreedyARGenerator:
                 k=1,
                 route_store=store,
                 model_backend=backend,
+                sampling=sampling,
             )
             routes = step.next_routes
 
@@ -91,11 +111,16 @@ class FlashInferPagedGreedyARGenerator:
             generated_token_ids=generated,
             finish_reason=finish_reason,
             metadata={
-                "backend": "sglang_flashinfer_paged_greedy_ar",
+                "backend": (
+                    "sglang_flashinfer_paged_sampled_ar"
+                    if do_sample
+                    else "sglang_flashinfer_paged_greedy_ar"
+                ),
                 "batch_size": 1,
                 "paged_kv": True,
                 "page_size": self.page_size,
-                "do_sample": False,
+                **sampling_config.to_dict(),
+                "generation_seed": int(generation_seed),
                 "runner": sglang_runner_component_report(self.runner),
             },
         )

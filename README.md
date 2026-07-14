@@ -577,6 +577,129 @@ final-answer phrase falls back to the last number unless `--strict-marker` is
 set. Use `--protocol zero-shot` only for a separate zero-shot experiment; its
 score is not directly comparable with those published numbers.
 
+### Seeded sampling and generation reproducibility
+
+Generation reproducibility does **not** require a fixed forest depth. Drafter
+sampling is request-isolated: every parent candidate set is keyed by the
+request's `generation_seed` and that parent's complete semantic token prefix.
+It is therefore independent of route/request-row IDs, batching order, whether
+the same parent was reached through tree or forest construction, and how many
+unused forest depths happened to finish before the Target response. GSM8K uses
+`generation_seed + example_index` for each request and records the resolved
+seed in `predictions.jsonl`.
+
+Use the normal live wall-clock forest boundary for the generation-level replay
+test below. It compares sampled `k=1` ATLAS against independently sampled
+Drafter paged AR with the same semantic-prefix RNG:
+
+```bash
+# Target: first_route, k=1, with both fallback thresholds omitted.
+python -m atlas_0709.target_server \
+  --model /home/hwc/models/Meta-Llama-3.1-8B-Instruct \
+  --host 127.0.0.1 --port 18109 \
+  --k 1 --d 4 --page-size 16 --dtype float16 \
+  --route-selection-policy first_route
+
+# Drafter: sampled AR and sampled ATLAS use the same seed and temperature.
+PYTHONHASHSEED=0 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+python tools/check_async_greedy_equivalence.py \
+  --drafter-model /home/hwc/models/Llama-3.2-1B-Instruct \
+  --target-url http://127.0.0.1:18109 \
+  --prompt "ATLAS seeded sampling equivalence." \
+  --d 4 --forest-depths live \
+  --max-new-tokens 64 --repeats 2 \
+  --seed 20260715 \
+  --drafter-do-sample --drafter-temperature 0.8 \
+  --deterministic-algorithms \
+  --json-out ../0709_outputs/sampled_ar_vs_atlas_live.json
+```
+
+`--fixed-forest-depth` and integer values passed to `--forest-depths` remain
+useful diagnostics: they remove the Target wall-clock boundary when isolating
+a particular KV promotion/cancellation case. They are not a prerequisite for
+the generation reproducibility claim. A seed is also not a promise of bitwise
+replay across different PyTorch/CUDA stacks or hardware; a numerical change
+can change a sampled decision when its uniform draw lies close to a CDF
+boundary.
+
+The Target can independently use route-level sampling:
+
+```bash
+python -m atlas_0709.target_server \
+  --model /home/hwc/models/Meta-Llama-3.1-8B-Instruct \
+  --host 0.0.0.0 --port 18090 \
+  --k 3 --d 4 --page-size 16 --dtype float16 \
+  --route-selection-policy target_sample \
+  --route-sampling-temperature 1.0
+
+python -m atlas_0709.distributed_system \
+  --drafter-model /home/hwc/models/Llama-3.2-1B-Instruct \
+  --target-url http://TARGET_HOST:18090 \
+  --prompt "ATLAS sampled generation." \
+  --k 3 --d 4 --max-new-tokens 64 \
+  --generation-seed 20260715 \
+  --drafter-do-sample --drafter-temperature 0.8 \
+  --json-out ../0709_outputs/atlas_target_sample.json
+```
+
+`target_sample` is applied **after** Target verification: it samples one of
+the verified complete routes from a softmax over Target selection scores, in a
+canonical semantic route order, using the explicit request seed and verify
+round. It does not sample Target tokens. If a fallback threshold fires, the
+current Target fallback AR path remains greedy.
+
+### Paired Target-intervention analysis on GSM8K
+
+For a quality attribution experiment, run `target_best` and `first_route` on
+the identical GSM8K indices, models, generation budget, Drafter sampling
+configuration, and base seed. Disable both fallback thresholds in both arms so
+the only treatment is Target route selection. For example, the serial system
+provides a scheduling-independent paired screen:
+
+```bash
+python scripts/gsm8k_eval.py \
+  --backend atlas_serial \
+  --model /home/hwc/models/Llama-3.2-1B-Instruct \
+  --target-model /home/hwc/models/Meta-Llama-3.1-8B-Instruct \
+  --data-file /home/hwc/workspace/thirdparty/grade-school-math/grade_school_math/data/test.jsonl \
+  --output-dir ../0709_outputs/gsm8k_target_best_seeded \
+  --k 3 --d 4 --max-new-tokens 512 --strict-marker \
+  --route-selection-policy target_best \
+  --fallback-threshold none --first-token-threshold none \
+  --generation-seed 20260715 \
+  --drafter-do-sample --drafter-temperature 0.8
+
+python scripts/gsm8k_eval.py \
+  --backend atlas_serial \
+  --model /home/hwc/models/Llama-3.2-1B-Instruct \
+  --target-model /home/hwc/models/Meta-Llama-3.1-8B-Instruct \
+  --data-file /home/hwc/workspace/thirdparty/grade-school-math/grade_school_math/data/test.jsonl \
+  --output-dir ../0709_outputs/gsm8k_first_route_seeded \
+  --k 3 --d 4 --max-new-tokens 512 --strict-marker \
+  --route-selection-policy first_route \
+  --fallback-threshold none --first-token-threshold none \
+  --generation-seed 20260715 \
+  --drafter-do-sample --drafter-temperature 0.8
+
+python tools/compare_gsm8k_target_intervention.py \
+  --target-best ../0709_outputs/gsm8k_target_best_seeded \
+  --first-route ../0709_outputs/gsm8k_first_route_seeded \
+  --json-out ../0709_outputs/gsm8k_target_intervention_paired.json
+```
+
+The audit keeps two baselines separate. A causal Target action is a selection
+away from `first_route` (or a fallback); probability displacement is measured
+against the Drafter's highest-probability complete route conditioned on the
+**current round prefix**, not a legacy beam score that contains a
+promoted-prefix constant. The summaries report both counts, changed
+first-token count, selection of lower Drafter first-token/path probability,
+selected Drafter-rank histogram, fallback count, and sample coverage. The
+paired final-answer report separately records
+`helped` (`target_best` correct, `first_route` wrong), `hurt`, net correct gain,
+response changes, and an exact two-sided McNemar p-value. Once the first output
+token differs, later round traces no longer have a one-to-one causal alignment;
+the paired final GSM8K answer is the causal unit.
+
 ## Validation
 
 CPU/control-flow checks:
@@ -597,13 +720,13 @@ python -m atlas_0709.target_server \
   --k 1 --d 4 --page-size 16 --dtype float16 \
   --route-selection-policy first_route
 
-# Drafter process. Fixed depths remove wall-clock scheduling from correctness.
+# Drafter process. Live is the generation-level reproducibility check.
 PYTHONHASHSEED=0 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
 python tools/check_async_greedy_equivalence.py \
   --drafter-model /home/hwc/models/Llama-3.2-1B-Instruct \
   --target-url http://127.0.0.1:18109 \
   --prompt "ATLAS KV equivalence." \
-  --d 4 --forest-depths 0,1,2,3,4 \
+  --d 4 --forest-depths live \
   --max-new-tokens 64 --repeats 2 \
   --deterministic-algorithms \
   --json-out ../0709_outputs/kv_equivalence.json
@@ -612,7 +735,8 @@ python tools/check_async_greedy_equivalence.py \
 This is intentionally a `k=1` test. For `k>1`, the first payload route is the
 highest cumulative-probability beam path and is not generally the Drafter's
 token-by-token greedy path. The diagnostic compares exact token IDs against
-`FlashInferPagedGreedyARGenerator` and checks fixed forest depths independently.
+`FlashInferPagedGreedyARGenerator` under the live forest schedule. Optional
+integer forest depths can still be checked independently to localize a failure.
 It also enables per-round coordinator/Drafter/Target prefix, physical slot-path,
 and request-row assertions. The production default remains Target best-path
 selection with wall-clock-controlled forest completion.

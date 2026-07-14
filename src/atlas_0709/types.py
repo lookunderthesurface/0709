@@ -83,6 +83,21 @@ class TargetRouteScore:
     first_token_logprob: float | None = None
     selection_score: float | None = None
     score_weights: tuple[float, ...] = ()
+    draft_token_logprobs: tuple[float, ...] = ()
+
+    @property
+    def draft_first_token_logprob(self) -> float | None:
+        if not self.draft_token_logprobs:
+            return None
+        return float(self.draft_token_logprobs[0])
+
+    @property
+    def draft_path_logprob(self) -> float:
+        """Current verified-path score, excluding any promoted-prefix constant."""
+
+        if self.draft_token_logprobs:
+            return float(sum(self.draft_token_logprobs))
+        return float(self.draft_logprob)
 
 
 @dataclass(frozen=True)

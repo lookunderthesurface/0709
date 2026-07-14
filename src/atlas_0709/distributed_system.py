@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -28,6 +29,10 @@ from .flashinfer_paged.builders import (
     select_routes_by_stage1_root,
 )
 from .flashinfer_paged.kv import KVTreeStore
+from .flashinfer_paged.sampling import (
+    DrafterSamplingConfig,
+    DrafterSamplingContext,
+)
 from .flashinfer_paged.sglang_runtime import (
     SGLangFlashInferFrontierModelBackend,
     SGLangRunnerConfig,
@@ -53,6 +58,9 @@ class DistributedAtlasConfig:
     max_new_tokens: int = 64
     eos_token_id: int | None = None
     fallback_ar_tokens: int = 4
+    generation_seed: int = 0
+    drafter_do_sample: bool = False
+    drafter_temperature: float = 1.0
     fixed_forest_depth: int | None = None
     validate_state_alignment: bool = False
 
@@ -65,6 +73,11 @@ class DistributedAtlasConfig:
             raise ValueError("max_new_tokens must be positive")
         if self.fallback_ar_tokens <= 0:
             raise ValueError("fallback_ar_tokens must be positive")
+        if (
+            not math.isfinite(float(self.drafter_temperature))
+            or float(self.drafter_temperature) <= 0.0
+        ):
+            raise ValueError("drafter_temperature must be finite and positive")
         if self.fixed_forest_depth is not None and not (
             0 <= int(self.fixed_forest_depth) <= int(self.d)
         ):
@@ -93,6 +106,7 @@ class DistributedRoundTrace:
     target_unmerged_path_nodes: int
     target_prefix_len_before: int
     target_prefix_len_after: int
+    target_decision_metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -143,6 +157,7 @@ class DistributedGenerationResult:
                     "target_unmerged_path_nodes": trace.target_unmerged_path_nodes,
                     "target_prefix_len_before": trace.target_prefix_len_before,
                     "target_prefix_len_after": trace.target_prefix_len_after,
+                    "target_decision_metadata": trace.target_decision_metadata,
                 }
                 for trace in self.rounds
             ],
@@ -177,8 +192,10 @@ class PagedDistributedAtlasGenerator:
         traces: list[DistributedRoundTrace] = []
         target_fallback_ar_profiles: list[dict[str, object]] = []
         target_health = self.target_client.health()
+        target_runtime_metadata = dict(target_health.get("metadata", {}))
         self._timeline_origin_s = time.perf_counter()
         timeline_rounds: list[EdgeRoundTimeline] = []
+        initial_sampling = self._drafter_sampling_context(committed)
 
         prebuilt_forest_frontier: list[RouteState] | None = None
         prebuilt_forest_completed: list[RouteState] | None = None
@@ -206,6 +223,7 @@ class PagedDistributedAtlasGenerator:
                 ctx.prefix,
                 k=self.config.k,
                 route_store=ctx.store,
+                sampling=initial_sampling,
             )
             stage1 = build_tree_depths(
                 active_routes,
@@ -213,6 +231,7 @@ class PagedDistributedAtlasGenerator:
                 k=self.config.k,
                 route_store=ctx.store,
                 model_backend=ctx.backend,
+                sampling=initial_sampling,
             )
             initial_tree_span = EdgeSpan(
                 name="edge_initial_stage1_tree",
@@ -229,6 +248,7 @@ class PagedDistributedAtlasGenerator:
                     stage1.last_logits,
                     k=self.config.k,
                     route_store=ctx.store,
+                    sampling=initial_sampling,
                 )
                 while (
                     not target_prefill_future.done()
@@ -240,6 +260,7 @@ class PagedDistributedAtlasGenerator:
                         k=self.config.k,
                         route_store=ctx.store,
                         model_backend=ctx.backend,
+                        sampling=initial_sampling,
                     )
                     prebuilt_forest_depth += 1
                     prebuilt_forest_spans.append(
@@ -260,6 +281,7 @@ class PagedDistributedAtlasGenerator:
         round_index = 0
         with ThreadPoolExecutor(max_workers=1) as verifier_pool:
             while len(generated) < self.config.max_new_tokens:
+                round_sampling = self._drafter_sampling_context(committed)
                 round_prefix_len = len(committed)
                 verify_routes = self._route_payloads(ctx.store, stage1.completed_routes)
                 verify_submit_s = self._timeline_now()
@@ -269,6 +291,7 @@ class PagedDistributedAtlasGenerator:
                     committed,
                     verify_routes,
                     remaining_tokens,
+                    round_index,
                 )
                 if round_index == 0 and prebuilt_forest_frontier is not None:
                     forest_depth = prebuilt_forest_depth
@@ -286,6 +309,7 @@ class PagedDistributedAtlasGenerator:
                         stage1.last_logits,
                         k=self.config.k,
                         route_store=ctx.store,
+                        sampling=round_sampling,
                     )
                 while self._should_build_forest_step(
                     verify_done=verify_future.done(),
@@ -297,6 +321,7 @@ class PagedDistributedAtlasGenerator:
                         k=self.config.k,
                         route_store=ctx.store,
                         model_backend=ctx.backend,
+                        sampling=round_sampling,
                     )
                     forest_depth += 1
                     forest_step_spans.append(
@@ -395,6 +420,7 @@ class PagedDistributedAtlasGenerator:
                             forest_frontier=forest_frontier,
                             forest_completed=forest_completed,
                             forest_last_logits=forest_last_logits,
+                            sampling=self._drafter_sampling_context(committed),
                         )
                         handoff_span = handoff.commit_prune_span
                         post_prune_tree_step_spans = list(handoff.tree_step_spans)
@@ -451,6 +477,9 @@ class PagedDistributedAtlasGenerator:
                         target_prefix_len_after=int(
                             target_verify_metadata.get("prefix_len_after", len(committed))
                         ),
+                        target_decision_metadata=self._compact_target_decision_metadata(
+                            target_verify_metadata
+                        ),
                     )
                 )
                 timeline_rounds.append(
@@ -500,6 +529,8 @@ class PagedDistributedAtlasGenerator:
                 "d": self.config.d,
                 "max_new_tokens": self.config.max_new_tokens,
                 "fallback_ar_tokens": int(self.config.fallback_ar_tokens),
+                "generation_seed": int(self.config.generation_seed),
+                "drafter_sampling": self._drafter_sampling_config().to_dict(),
                 "fixed_forest_depth": self.config.fixed_forest_depth,
                 "validate_state_alignment": bool(self.config.validate_state_alignment),
                 "rebuild_drafter_prefix_after_commit": False,
@@ -508,7 +539,13 @@ class PagedDistributedAtlasGenerator:
                 "target_fallback_ar_profiles": target_fallback_ar_profiles,
                 "rebuild_target_prefix_after_commit": False,
                 "cross_round_stage2_kv_reuse": True,
-                "target_selection_policy": "best_of_n_full_path_with_optional_target_ar_fallback",
+                "target_selection_policy": target_runtime_metadata.get(
+                    "selection_policy",
+                    "best_of_n_full_path_with_optional_target_ar_fallback",
+                ),
+                "target_route_selection_policy": target_runtime_metadata.get(
+                    "route_selection_policy"
+                ),
                 "cross_round_target_kv_reuse": True,
                 "route_tail_page_cow": True,
                 "branch_safe_page_size": True,
@@ -533,6 +570,7 @@ class PagedDistributedAtlasGenerator:
         committed: Sequence[int],
         routes: Sequence[dict[str, object]],
         remaining_tokens: int,
+        round_index: int,
     ) -> tuple[dict[str, object], float]:
         response = self.target_client.verify(
             prefix_token_ids=committed,
@@ -540,6 +578,8 @@ class PagedDistributedAtlasGenerator:
             fallback_max_tokens=min(int(self.config.fallback_ar_tokens), int(remaining_tokens)),
             selected_path_max_tokens=int(remaining_tokens),
             eos_token_id=self.config.eos_token_id,
+            route_sampling_seed=int(self.config.generation_seed),
+            route_sampling_round=int(round_index),
         )
         return response, self._timeline_now()
 
@@ -664,6 +704,51 @@ class PagedDistributedAtlasGenerator:
         store.committed_token_ids = [int(token_id) for token_id in committed]
         return PagedPrefixContext(store=store, backend=backend, prefix=prefix)
 
+    def _drafter_sampling_config(self) -> DrafterSamplingConfig:
+        return DrafterSamplingConfig(
+            do_sample=bool(self.config.drafter_do_sample),
+            seed=int(self.config.generation_seed),
+            temperature=float(self.config.drafter_temperature),
+        )
+
+    def _drafter_sampling_context(
+        self,
+        committed: Sequence[int],
+    ) -> DrafterSamplingContext:
+        return DrafterSamplingContext(
+            config=self._drafter_sampling_config(),
+            committed_token_ids=tuple(int(token_id) for token_id in committed),
+        )
+
+    @staticmethod
+    def _compact_target_decision_metadata(
+        metadata: dict[str, object],
+    ) -> dict[str, object]:
+        keys = (
+            "selection_policy",
+            "route_sampling_enabled",
+            "route_sampling_scope",
+            "route_sampling_seed",
+            "route_sampling_round",
+            "route_sampling_temperature",
+            "route_sampling_uniform",
+            "route_sampling_selected_probability",
+            "route_sampling_selected_cdf_low",
+            "route_sampling_selected_cdf_high",
+            "route_sampling_boundary_margin",
+            "route_sampling_ordered_candidates",
+            "selected_draft_rank",
+            "route0_route_id",
+            "draft_top_route_id",
+            "selected_route_changed_from_route0",
+            "selected_first_token_changed_from_route0",
+            "selected_minus_route0_draft_first_token_logprob",
+            "selected_minus_route0_draft_logprob",
+            "selected_minus_route0_target_selection_score",
+            "route_intervention",
+        )
+        return {key: metadata[key] for key in keys if key in metadata}
+
     def _fallback_extend_handoff(
         self,
         *,
@@ -705,6 +790,7 @@ class PagedDistributedAtlasGenerator:
             prefix,
             k=self.config.k,
             route_store=ctx.store,
+            sampling=self._drafter_sampling_context(ctx.store.committed_token_ids),
         )
         stage1 = build_tree_depths(
             active_routes,
@@ -712,6 +798,7 @@ class PagedDistributedAtlasGenerator:
             k=self.config.k,
             route_store=ctx.store,
             model_backend=ctx.backend,
+            sampling=self._drafter_sampling_context(ctx.store.committed_token_ids),
         )
         return stage1, {
             "committed_kv_tokens": len(suffix),
@@ -729,6 +816,7 @@ class PagedDistributedAtlasGenerator:
         forest_frontier: Sequence[RouteState],
         forest_completed: Sequence[RouteState] | None,
         forest_last_logits: torch.Tensor | None,
+        sampling: DrafterSamplingContext,
     ) -> StageHandoff:
         selected_root_id = int(selected_stage1_route.route_id)
         timeline_active = getattr(self, "_timeline_origin_s", None) is not None
@@ -813,6 +901,7 @@ class PagedDistributedAtlasGenerator:
                 k=self.config.k,
                 route_store=ctx.store,
                 model_backend=ctx.backend,
+                sampling=sampling,
             )
             tree_step_spans.append(
                 EdgeSpan(
@@ -848,11 +937,19 @@ class PagedDistributedAtlasGenerator:
     ) -> list[dict[str, object]]:
         payloads: list[dict[str, object]] = []
         for route in routes:
+            draft_token_logprobs = tuple(
+                float(value)
+                for value in route.token_logprobs[: int(route.stage1_depth)]
+            )
             payloads.append(
                 {
                     "route_id": int(route.route_id),
                     "token_ids": [int(token_id) for token_id in store.materialized_token_path(route)[: route.stage1_depth]],
+                    # Preserve the historical cumulative beam score for
+                    # debugging. Target/evaluators use draft_token_logprobs
+                    # for the current-prefix path score after promotion.
                     "draft_logprob": float(route.cumulative_logprob),
+                    "draft_token_logprobs": list(draft_token_logprobs),
                 }
             )
         return payloads
@@ -954,6 +1051,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help="Maximum Target AR tokens the Edge will accept on a low-confidence fallback.",
+    )
+    parser.add_argument(
+        "--generation-seed",
+        type=int,
+        default=0,
+        help=(
+            "Request-level seed used by semantic-prefix Drafter sampling and "
+            "Target route sampling. It is sent explicitly on every verify round."
+        ),
+    )
+    parser.add_argument(
+        "--drafter-do-sample",
+        action="store_true",
+        help=(
+            "Sample each Drafter parent candidate set without replacement. RNG "
+            "is keyed by the complete semantic token prefix, so forest timing "
+            "does not advance or reorder the generation random stream."
+        ),
+    )
+    parser.add_argument(
+        "--drafter-temperature",
+        type=float,
+        default=1.0,
+        help="Proposal temperature for --drafter-do-sample.",
     )
     parser.add_argument("--dtype", default="float16")
     parser.add_argument("--context-length", type=int, default=None)
@@ -1066,6 +1187,9 @@ def main() -> int:
                     max_new_tokens=warmup_generated_tokens,
                     eos_token_id=None,
                     fallback_ar_tokens=args.fallback_ar_tokens,
+                    generation_seed=args.generation_seed,
+                    drafter_do_sample=args.drafter_do_sample,
+                    drafter_temperature=args.drafter_temperature,
                     fixed_forest_depth=args.fixed_forest_depth,
                     validate_state_alignment=args.validate_state_alignment,
                 ),
@@ -1092,6 +1216,9 @@ def main() -> int:
                 max_new_tokens=args.max_new_tokens,
                 eos_token_id=args.eos_token_id,
                 fallback_ar_tokens=args.fallback_ar_tokens,
+                generation_seed=args.generation_seed,
+                drafter_do_sample=args.drafter_do_sample,
+                drafter_temperature=args.drafter_temperature,
                 fixed_forest_depth=args.fixed_forest_depth,
                 validate_state_alignment=args.validate_state_alignment,
             ),

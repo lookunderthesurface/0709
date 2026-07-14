@@ -71,12 +71,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--route-selection-policy",
-        choices=["target_best", "first_route"],
+        choices=["target_best", "target_sample", "first_route"],
         default="target_best",
         help=(
-            "Route decision policy. first_route is a correctness diagnostic that "
-            "always commits the first payload route and requires fallback thresholds "
-            "to be omitted."
+            "Route-level decision policy after Target verification. target_sample "
+            "samples the finite verified-route distribution and requires every verify "
+            "request to carry route_sampling_seed and route_sampling_round. This does "
+            "not enable token sampling; fallback AR remains greedy. first_route is a "
+            "correctness diagnostic and requires fallback thresholds to be omitted."
+        ),
+    )
+    parser.add_argument(
+        "--route-sampling-temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Temperature for target_sample's route-level softmax over Target selection "
+            "scores. It does not affect target_best or token generation."
         ),
     )
     return parser
@@ -109,6 +120,7 @@ def main() -> int:
         fallback_ar_tokens=args.fallback_ar_tokens,
         profile_fallback_ar=args.profile_fallback_ar,
         route_selection_policy=args.route_selection_policy,
+        route_sampling_temperature=args.route_sampling_temperature,
     )
     serve_target(TargetServerApp(backend), host=args.host, port=args.port)
     return 0

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
+import math
 import time
 from typing import Sequence
 
@@ -32,6 +35,7 @@ class VerifyRoutePayload:
     route_id: int
     token_ids: tuple[int, ...]
     draft_logprob: float
+    draft_token_logprobs: tuple[float, ...] = ()
 
 
 class DirectFlashInferMaskedTreeVerifyBackend:
@@ -55,6 +59,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         fallback_ar_tokens: int = 4,
         profile_fallback_ar: bool = False,
         route_selection_policy: str = "target_best",
+        route_sampling_temperature: float = 1.0,
     ) -> None:
         config.validate()
         self.model_path = model_path
@@ -70,6 +75,9 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         self.profile_fallback_ar = bool(profile_fallback_ar)
         self.route_selection_policy = self._validate_route_selection_policy(
             route_selection_policy
+        )
+        self.route_sampling_temperature = self._validate_route_sampling_temperature(
+            route_sampling_temperature
         )
         if self.fallback_ar_tokens <= 0:
             raise ValueError("fallback_ar_tokens must be positive")
@@ -142,6 +150,8 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         fallback_max_tokens: int | None = None,
         selected_path_max_tokens: int | None = None,
         eos_token_id: int | None = None,
+        route_sampling_seed: int | None = None,
+        route_sampling_round: int | None = None,
     ) -> TargetVerifyResult:
         prefix = tuple(int(token_id) for token_id in prefix_token_ids)
         if self._paged_prefix_kv is None or self._prefix_logits is None:
@@ -163,6 +173,13 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             raise ValueError("verify route ids must be unique")
 
         paths = [tuple(int(token_id) for token_id in route.token_ids) for route in routes]
+        for route, path in zip(routes, paths):
+            if route.draft_token_logprobs and len(route.draft_token_logprobs) != len(path):
+                raise ValueError(
+                    "draft_token_logprobs must be empty or match route depth: "
+                    f"route_id={int(route.route_id)}, "
+                    f"values={len(route.draft_token_logprobs)}, depth={len(path)}"
+                )
         path_lengths = {len(path) for path in paths}
         if len(path_lengths) != 1:
             raise ValueError(f"all verify routes must have the same depth, got {sorted(path_lengths)}")
@@ -204,11 +221,15 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             scores,
             key=lambda item: (
                 self._selection_score(item),
-                item.draft_logprob,
+                item.draft_path_logprob,
                 -item.route_id,
             ),
         )
-        selected = self._select_route(scores)
+        selected, route_sampling_metadata = self._select_route_with_metadata(
+            scores,
+            route_sampling_seed=route_sampling_seed,
+            route_sampling_round=route_sampling_round,
+        )
         fallback_reason = self._fallback_reason(selected)
         prefix_len_before = len(self.prefix_token_ids)
         common_metadata = {
@@ -226,6 +247,8 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             "fallback_threshold": self.fallback_threshold,
             "first_token_threshold": self.first_token_threshold,
             "fallback_ar_tokens": int(self.fallback_ar_tokens),
+            **route_sampling_metadata,
+            **self._route_intervention_metadata(scores, selected),
         }
         if fallback_reason is not None:
             generated = self._generate_fallback_ar(
@@ -321,6 +344,9 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             "deduplicated_tree_nodes": True,
             "selection_policy": self._selection_policy_name(),
             "route_selection_policy": self.route_selection_policy,
+            "route_sampling_scope": "verified_route_level_only",
+            "route_sampling_temperature": float(self.route_sampling_temperature),
+            "fallback_ar_sampling": "greedy_argmax",
             "score_weights": (
                 None if self.score_weights is None else [float(value) for value in self.score_weights]
             ),
@@ -360,6 +386,10 @@ class DirectFlashInferMaskedTreeVerifyBackend:
     def _selection_policy_name(self) -> str:
         if self.route_selection_policy == "first_route":
             return "diagnostic_first_payload_route"
+        if self.route_selection_policy == "target_sample":
+            if self.score_weights is None:
+                return "sample_target_route_logprob_distribution"
+            return "sample_weighted_target_route_score_distribution"
         if self.score_weights is None:
             return "best_of_n_target_path_logprob"
         return "best_of_n_weighted_target_path_logprob"
@@ -367,25 +397,280 @@ class DirectFlashInferMaskedTreeVerifyBackend:
     @staticmethod
     def _validate_route_selection_policy(policy: str) -> str:
         value = str(policy).strip().lower()
-        if value not in {"target_best", "first_route"}:
+        if value not in {"target_best", "target_sample", "first_route"}:
             raise ValueError(
-                "route_selection_policy must be one of: target_best, first_route"
+                "route_selection_policy must be one of: target_best, target_sample, first_route"
             )
         return value
 
-    def _select_route(self, scores: Sequence[TargetRouteScore]) -> TargetRouteScore:
+    @staticmethod
+    def _validate_route_sampling_temperature(temperature: float) -> float:
+        value = float(temperature)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("route_sampling_temperature must be finite and positive")
+        return value
+
+    def _select_route(
+        self,
+        scores: Sequence[TargetRouteScore],
+        *,
+        route_sampling_seed: int | None = None,
+        route_sampling_round: int | None = None,
+    ) -> TargetRouteScore:
+        selected, _ = self._select_route_with_metadata(
+            scores,
+            route_sampling_seed=route_sampling_seed,
+            route_sampling_round=route_sampling_round,
+        )
+        return selected
+
+    def _select_route_with_metadata(
+        self,
+        scores: Sequence[TargetRouteScore],
+        *,
+        route_sampling_seed: int | None = None,
+        route_sampling_round: int | None = None,
+    ) -> tuple[TargetRouteScore, dict[str, object]]:
         if not scores:
             raise ValueError("cannot select from an empty route score list")
         if self.route_selection_policy == "first_route":
-            return scores[0]
-        return max(
+            return scores[0], self._route_sampling_disabled_metadata()
+        if self.route_selection_policy == "target_sample":
+            return self._sample_target_route(
+                scores,
+                route_sampling_seed=route_sampling_seed,
+                route_sampling_round=route_sampling_round,
+            )
+        selected = max(
             scores,
             key=lambda item: (
                 self._selection_score(item),
-                item.draft_logprob,
+                item.draft_path_logprob,
                 -item.route_id,
             ),
         )
+        return selected, self._route_sampling_disabled_metadata()
+
+    def _sample_target_route(
+        self,
+        scores: Sequence[TargetRouteScore],
+        *,
+        route_sampling_seed: int | None,
+        route_sampling_round: int | None,
+    ) -> tuple[TargetRouteScore, dict[str, object]]:
+        if route_sampling_seed is None or route_sampling_round is None:
+            raise ValueError(
+                "target_sample requires explicit route_sampling_seed and "
+                "route_sampling_round on every verify request"
+            )
+        sampling_round = int(route_sampling_round)
+        if sampling_round < 0:
+            raise ValueError("route_sampling_round must be non-negative")
+        sampling_seed = int(route_sampling_seed)
+
+        # Canonical semantic ordering makes the draw independent of RPC payload
+        # ordering and route-id allocation. A route id is used only as the final
+        # tie break for duplicate, otherwise semantically identical token paths.
+        ordered = sorted(
+            scores,
+            key=lambda item: (
+                tuple(int(token_id) for token_id in item.token_ids),
+                float(item.draft_path_logprob),
+                self._selection_score(item),
+                int(item.route_id),
+            ),
+        )
+        sampling_temperature = float(getattr(self, "route_sampling_temperature", 1.0))
+        scaled_logits = [
+            self._selection_score(item) / sampling_temperature
+            for item in ordered
+        ]
+        if any(math.isnan(value) for value in scaled_logits):
+            raise ValueError("cannot sample a route from NaN target scores")
+        positive_infinity = [math.isinf(value) and value > 0.0 for value in scaled_logits]
+        if any(positive_infinity):
+            count = sum(positive_infinity)
+            probabilities = [1.0 / count if flag else 0.0 for flag in positive_infinity]
+        else:
+            finite_logits = [value for value in scaled_logits if math.isfinite(value)]
+            if not finite_logits:
+                probabilities = [1.0 / len(ordered)] * len(ordered)
+            else:
+                maximum = max(finite_logits)
+                weights = [
+                    0.0 if value == -math.inf else math.exp(value - maximum)
+                    for value in scaled_logits
+                ]
+                total = sum(weights)
+                probabilities = [weight / total for weight in weights]
+
+        seed_material = (
+            f"atlas0709-target-route-sample-v1:{sampling_seed}:{sampling_round}"
+        ).encode("utf-8")
+        draw_bits = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+        draw = (draw_bits + 0.5) / float(1 << 64)
+        selected_index = len(ordered) - 1
+        cdf_low = 0.0
+        cdf_high = 1.0
+        cumulative = 0.0
+        for index, probability in enumerate(probabilities):
+            next_cumulative = cumulative + probability
+            if draw < next_cumulative or index == len(ordered) - 1:
+                selected_index = index
+                cdf_low = cumulative
+                cdf_high = next_cumulative if index < len(ordered) - 1 else 1.0
+                break
+            cumulative = next_cumulative
+        selected = ordered[selected_index]
+        audit_rows = []
+        for item, probability in zip(ordered, probabilities):
+            audit_rows.append(
+                {
+                    "route_id": int(item.route_id),
+                    "token_path_hash": self._token_path_hash(item.token_ids),
+                    "probability": float(probability),
+                }
+            )
+        return selected, {
+            "route_sampling_enabled": True,
+            "route_sampling_scope": "verified_route_level_only",
+            "route_sampling_seed": sampling_seed,
+            "route_sampling_round": sampling_round,
+            "route_sampling_temperature": sampling_temperature,
+            "route_sampling_uniform": float(draw),
+            "route_sampling_selected_probability": float(probabilities[selected_index]),
+            "route_sampling_selected_cdf_low": float(cdf_low),
+            "route_sampling_selected_cdf_high": float(cdf_high),
+            "route_sampling_boundary_margin": float(min(draw - cdf_low, cdf_high - draw)),
+            "route_sampling_ordered_candidates": audit_rows,
+        }
+
+    def _route_sampling_disabled_metadata(self) -> dict[str, object]:
+        return {
+            "route_sampling_enabled": False,
+            "route_sampling_scope": "verified_route_level_only",
+            "route_sampling_seed": None,
+            "route_sampling_round": None,
+            "route_sampling_temperature": float(
+                getattr(self, "route_sampling_temperature", 1.0)
+            ),
+        }
+
+    @staticmethod
+    def _token_path_hash(token_ids: Sequence[int]) -> str:
+        payload = json.dumps(
+            [int(token_id) for token_id in token_ids],
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _route_intervention_metadata(
+        self,
+        scores: Sequence[TargetRouteScore],
+        selected: TargetRouteScore,
+    ) -> dict[str, object]:
+        if not scores:
+            raise ValueError("route intervention metadata requires non-empty scores")
+        route0 = scores[0]
+        draft_order = sorted(
+            enumerate(scores),
+            key=lambda pair: (-float(pair[1].draft_path_logprob), int(pair[0])),
+        )
+        draft_ranks = {
+            int(score.route_id): rank
+            for rank, (_, score) in enumerate(draft_order, start=1)
+        }
+        draft_top = draft_order[0][1]
+
+        def route_summary(score: TargetRouteScore) -> dict[str, object]:
+            return {
+                "route_id": int(score.route_id),
+                "token_path_hash": self._token_path_hash(score.token_ids),
+                "first_token_id": int(score.token_ids[0]),
+                "draft_rank": int(draft_ranks[int(score.route_id)]),
+                "draft_first_token_logprob": score.draft_first_token_logprob,
+                "draft_path_logprob": float(score.draft_path_logprob),
+                "legacy_cumulative_draft_logprob": float(score.draft_logprob),
+                "target_first_token_logprob": (
+                    None
+                    if score.first_token_logprob is None
+                    else float(score.first_token_logprob)
+                ),
+                "target_logprob": float(score.target_logprob),
+                "target_selection_score": float(self._selection_score(score)),
+            }
+
+        def optional_delta(left: float | None, right: float | None) -> float | None:
+            if left is None or right is None:
+                return None
+            return float(left) - float(right)
+
+        def comparison(baseline: TargetRouteScore) -> dict[str, object]:
+            selected_first_draft = selected.draft_first_token_logprob
+            baseline_first_draft = baseline.draft_first_token_logprob
+            return {
+                "route_changed": tuple(selected.token_ids) != tuple(baseline.token_ids),
+                "first_token_changed": (
+                    int(selected.token_ids[0]) != int(baseline.token_ids[0])
+                ),
+                "draft_first_token_logprob_delta": optional_delta(
+                    selected_first_draft,
+                    baseline_first_draft,
+                ),
+                "draft_path_logprob_delta": (
+                    float(selected.draft_path_logprob)
+                    - float(baseline.draft_path_logprob)
+                ),
+                "legacy_cumulative_draft_logprob_delta": (
+                    float(selected.draft_logprob) - float(baseline.draft_logprob)
+                ),
+                "target_first_token_logprob_delta": optional_delta(
+                    selected.first_token_logprob,
+                    baseline.first_token_logprob,
+                ),
+                "target_path_logprob_delta": (
+                    float(selected.target_logprob) - float(baseline.target_logprob)
+                ),
+                "target_selection_score_delta": (
+                    self._selection_score(selected) - self._selection_score(baseline)
+                ),
+            }
+
+        vs_route0 = comparison(route0)
+        vs_draft_top = comparison(draft_top)
+        intervention = {
+            "baseline": "route0",
+            "draft_token_logprobs_available": bool(
+                all(score.draft_token_logprobs for score in scores)
+            ),
+            "route0_is_draft_top": int(route0.route_id) == int(draft_top.route_id),
+            "route0": route_summary(route0),
+            "draft_top": route_summary(draft_top),
+            "selected": route_summary(selected),
+            "selected_vs_route0": vs_route0,
+            "selected_vs_draft_top": vs_draft_top,
+        }
+        # Frequently aggregated fields are duplicated at the top level so an
+        # evaluator does not need to understand the complete audit structure.
+        return {
+            "route_intervention": intervention,
+            "selected_draft_rank": int(draft_ranks[int(selected.route_id)]),
+            "route0_route_id": int(route0.route_id),
+            "draft_top_route_id": int(draft_top.route_id),
+            "selected_route_changed_from_route0": bool(vs_route0["route_changed"]),
+            "selected_first_token_changed_from_route0": bool(
+                vs_route0["first_token_changed"]
+            ),
+            "selected_minus_route0_draft_first_token_logprob": vs_route0[
+                "draft_first_token_logprob_delta"
+            ],
+            "selected_minus_route0_draft_logprob": float(
+                vs_route0["draft_path_logprob_delta"]
+            ),
+            "selected_minus_route0_target_selection_score": float(
+                vs_route0["target_selection_score_delta"]
+            ),
+        }
 
     @staticmethod
     def _truncate_selected_path(
@@ -472,6 +757,9 @@ class DirectFlashInferMaskedTreeVerifyBackend:
                     first_token_logprob=token_logprobs[0],
                     selection_score=selection_score,
                     score_weights=() if weights is None else tuple(weights),
+                    draft_token_logprobs=tuple(
+                        float(value) for value in route.draft_token_logprobs
+                    ),
                 )
             )
         return scores
@@ -632,8 +920,16 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         self._committed_verify_rounds += 1
 
 def verify_payload_from_mapping(item: dict[str, object]) -> VerifyRoutePayload:
+    raw_draft_token_logprobs = item.get("draft_token_logprobs")
+    if raw_draft_token_logprobs is None:
+        draft_token_logprobs: tuple[float, ...] = ()
+    elif isinstance(raw_draft_token_logprobs, (list, tuple)):
+        draft_token_logprobs = tuple(float(value) for value in raw_draft_token_logprobs)
+    else:
+        raise ValueError("draft_token_logprobs must be a list of numbers when provided")
     return VerifyRoutePayload(
         route_id=int(item["route_id"]),
         token_ids=tuple(int(token_id) for token_id in item["token_ids"]),
         draft_logprob=float(item.get("draft_logprob", 0.0)),
+        draft_token_logprobs=draft_token_logprobs,
     )

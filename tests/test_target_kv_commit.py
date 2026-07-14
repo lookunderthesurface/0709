@@ -159,9 +159,187 @@ def test_route_selection_policy_validation() -> None:
             "sample"
         )
     except ValueError as exc:
-        assert "target_best, first_route" in str(exc)
+        assert "target_best, target_sample, first_route" in str(exc)
     else:
         raise AssertionError("invalid route policy was accepted")
+
+
+def test_target_route_sampling_is_seeded_and_payload_order_independent() -> None:
+    backend = object.__new__(DirectFlashInferMaskedTreeVerifyBackend)
+    backend.route_selection_policy = "target_sample"
+    backend.route_sampling_temperature = 1.0
+    scores = [
+        TargetRouteScore(
+            route_id=8,
+            token_ids=(30, 31),
+            target_logprob=-1.0,
+            draft_logprob=-0.8,
+        ),
+        TargetRouteScore(
+            route_id=2,
+            token_ids=(10, 11),
+            target_logprob=-1.4,
+            draft_logprob=-0.2,
+        ),
+        TargetRouteScore(
+            route_id=5,
+            token_ids=(20, 21),
+            target_logprob=-0.7,
+            draft_logprob=-0.5,
+        ),
+    ]
+
+    selected_a, metadata_a = backend._select_route_with_metadata(
+        scores,
+        route_sampling_seed=1234,
+        route_sampling_round=7,
+    )
+    selected_b, metadata_b = backend._select_route_with_metadata(
+        list(reversed(scores)),
+        route_sampling_seed=1234,
+        route_sampling_round=7,
+    )
+    _, next_round_metadata = backend._select_route_with_metadata(
+        scores,
+        route_sampling_seed=1234,
+        route_sampling_round=8,
+    )
+
+    assert selected_a.token_ids == selected_b.token_ids
+    assert metadata_a["route_sampling_uniform"] == metadata_b["route_sampling_uniform"]
+    assert (
+        metadata_a["route_sampling_ordered_candidates"]
+        == metadata_b["route_sampling_ordered_candidates"]
+    )
+    assert (
+        metadata_a["route_sampling_uniform"]
+        != next_round_metadata["route_sampling_uniform"]
+    )
+    assert metadata_a["route_sampling_scope"] == "verified_route_level_only"
+    assert metadata_a["route_sampling_boundary_margin"] >= 0.0
+
+
+def test_target_route_sampling_requires_explicit_seed_and_round() -> None:
+    backend = object.__new__(DirectFlashInferMaskedTreeVerifyBackend)
+    backend.route_selection_policy = "target_sample"
+    backend.route_sampling_temperature = 1.0
+    scores = [
+        TargetRouteScore(
+            route_id=1,
+            token_ids=(10,),
+            target_logprob=-1.0,
+            draft_logprob=-1.0,
+        )
+    ]
+
+    try:
+        backend._select_route(scores, route_sampling_seed=5)
+    except ValueError as exc:
+        assert "explicit route_sampling_seed" in str(exc)
+    else:
+        raise AssertionError("target_sample accepted a request without a round")
+
+
+def test_route_intervention_metadata_compares_selected_to_draft_route0() -> None:
+    backend = object.__new__(DirectFlashInferMaskedTreeVerifyBackend)
+    route0 = TargetRouteScore(
+        route_id=10,
+        token_ids=(100, 101),
+        target_logprob=-5.0,
+        draft_logprob=-0.1,
+        first_token_logprob=-2.0,
+        selection_score=-5.0,
+        draft_token_logprobs=(-0.05, -0.05),
+    )
+    selected = TargetRouteScore(
+        route_id=20,
+        token_ids=(200, 201),
+        target_logprob=-1.0,
+        draft_logprob=-2.0,
+        first_token_logprob=-0.2,
+        selection_score=-1.0,
+        draft_token_logprobs=(-1.0, -1.0),
+    )
+
+    metadata = backend._route_intervention_metadata([route0, selected], selected)
+    intervention = metadata["route_intervention"]
+
+    assert metadata["selected_draft_rank"] == 2
+    assert metadata["route0_route_id"] == 10
+    assert metadata["draft_top_route_id"] == 10
+    assert metadata["selected_route_changed_from_route0"] is True
+    assert metadata["selected_first_token_changed_from_route0"] is True
+    assert abs(metadata["selected_minus_route0_draft_first_token_logprob"] + 0.95) < 1e-8
+    assert abs(metadata["selected_minus_route0_draft_logprob"] + 1.9) < 1e-8
+    assert abs(metadata["selected_minus_route0_target_selection_score"] - 4.0) < 1e-8
+    assert intervention["draft_token_logprobs_available"] is True
+    assert intervention["selected_vs_draft_top"]["first_token_changed"] is True
+
+
+def test_route_intervention_draft_rank_uses_current_path_not_promoted_constant() -> None:
+    backend = object.__new__(DirectFlashInferMaskedTreeVerifyBackend)
+    path_top_with_low_legacy_cumulative = TargetRouteScore(
+        route_id=1,
+        token_ids=(10, 11),
+        target_logprob=-3.0,
+        draft_logprob=-102.0,
+        draft_token_logprobs=(-0.8, -1.2),
+    )
+    selected = TargetRouteScore(
+        route_id=2,
+        token_ids=(20, 21),
+        target_logprob=-1.0,
+        draft_logprob=-13.0,
+        draft_token_logprobs=(-1.0, -2.0),
+    )
+
+    metadata = backend._route_intervention_metadata(
+        [path_top_with_low_legacy_cumulative, selected],
+        selected,
+    )
+    intervention = metadata["route_intervention"]
+
+    assert metadata["draft_top_route_id"] == 1
+    assert metadata["selected_draft_rank"] == 2
+    assert metadata["selected_minus_route0_draft_logprob"] == -1.0
+    assert (
+        intervention["selected_vs_route0"]["legacy_cumulative_draft_logprob_delta"]
+        == 89.0
+    )
+
+
+def test_target_best_tie_break_uses_current_path_not_promoted_constant() -> None:
+    backend = object.__new__(DirectFlashInferMaskedTreeVerifyBackend)
+    backend.route_selection_policy = "target_best"
+    current_path_top = TargetRouteScore(
+        route_id=1,
+        token_ids=(10, 11),
+        target_logprob=-1.0,
+        draft_logprob=-100.0,
+        draft_token_logprobs=(-0.1, -0.2),
+    )
+    legacy_cumulative_top = TargetRouteScore(
+        route_id=2,
+        token_ids=(20, 21),
+        target_logprob=-1.0,
+        draft_logprob=-2.0,
+        draft_token_logprobs=(-1.0, -1.0),
+    )
+
+    selected = backend._select_route([legacy_cumulative_top, current_path_top])
+
+    assert selected.route_id == 1
+
+
+def test_route_sampling_temperature_validation() -> None:
+    assert DirectFlashInferMaskedTreeVerifyBackend._validate_route_sampling_temperature(0.5) == 0.5
+    for invalid in (0.0, -1.0, float("inf"), float("nan")):
+        try:
+            DirectFlashInferMaskedTreeVerifyBackend._validate_route_sampling_temperature(invalid)
+        except ValueError as exc:
+            assert "finite and positive" in str(exc)
+        else:
+            raise AssertionError(f"invalid route sampling temperature was accepted: {invalid}")
 
 
 def test_selected_path_commit_is_truncated_by_budget_and_eos() -> None:

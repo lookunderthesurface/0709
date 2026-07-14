@@ -30,6 +30,7 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
         traces: list[DistributedRoundTrace] = []
         target_fallback_ar_profiles: list[dict[str, object]] = []
         target_health = self.target_client.health()
+        target_runtime_metadata = dict(target_health.get("metadata", {}))
 
         prefill_start = time.perf_counter()
         self.target_client.prefill(committed)
@@ -47,11 +48,13 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
         fallback_appended_tokens = 0
         total_start = time.perf_counter()
         while len(generated) < self.config.max_new_tokens:
+            round_sampling = self._drafter_sampling_context(committed)
             drafter_start = time.perf_counter()
             active_routes = initialize_stage1_routes(
                 prefix,
                 k=self.config.k,
                 route_store=ctx.store,
+                sampling=round_sampling,
             )
             stage1 = build_tree_depths(
                 active_routes,
@@ -59,6 +62,7 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                 k=self.config.k,
                 route_store=ctx.store,
                 model_backend=ctx.backend,
+                sampling=round_sampling,
             )
             # SGLang model calls enqueue CUDA work. Synchronize at the phase
             # boundary so pending Drafter kernels are not charged to the
@@ -77,6 +81,8 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                 ),
                 selected_path_max_tokens=int(remaining_tokens),
                 eos_token_id=self.config.eos_token_id,
+                route_sampling_seed=int(self.config.generation_seed),
+                route_sampling_round=int(round_index),
             )
             verify_elapsed_s = time.perf_counter() - verify_start
             target_elapsed_s += verify_elapsed_s
@@ -189,6 +195,9 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                     target_prefix_len_after=int(
                         target_verify_metadata.get("prefix_len_after", len(committed))
                     ),
+                    target_decision_metadata=self._compact_target_decision_metadata(
+                        target_verify_metadata
+                    ),
                 )
             )
             round_index += 1
@@ -222,12 +231,20 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                 "d": self.config.d,
                 "max_new_tokens": self.config.max_new_tokens,
                 "fallback_ar_tokens": int(self.config.fallback_ar_tokens),
+                "generation_seed": int(self.config.generation_seed),
+                "drafter_sampling": self._drafter_sampling_config().to_dict(),
                 "drafter_prefill_elapsed_s": drafter_prefill_elapsed_s,
                 "rebuild_drafter_prefix_after_commit": False,
                 "cross_round_drafter_prefix_kv_reuse": True,
                 "cross_round_stage2_kv_reuse": False,
                 "cross_round_target_kv_reuse": True,
-                "target_selection_policy": "best_of_n_full_path_with_optional_target_ar_fallback",
+                "target_selection_policy": target_runtime_metadata.get(
+                    "selection_policy",
+                    "best_of_n_full_path_with_optional_target_ar_fallback",
+                ),
+                "target_route_selection_policy": target_runtime_metadata.get(
+                    "route_selection_policy"
+                ),
                 "target_prefill_elapsed_s": target_prefill_elapsed_s,
                 "last_verify_elapsed_s": verify_elapsed_s if traces else None,
                 # All three throughputs intentionally use the same numerator:

@@ -81,6 +81,12 @@ class KVTreeStore:
             node_id = int(raw_node_id)
             parent_node_id = route.kv_view.node_ids[-1] if route.kv_view.node_ids else None
             next_depth = route.total_materialized_depth() + 1
+            if route.token_logprobs and len(route.token_logprobs) != next_depth:
+                raise ValueError(
+                    "frontier route token_logprobs must include exactly its pending token: "
+                    f"route_id={route.route_id}, logprobs={len(route.token_logprobs)}, "
+                    f"next_materialized_depth={next_depth}"
+                )
             self.nodes[node_id] = KVTreeNode(
                 node_id=node_id,
                 token_id=int(route.pending_token_id),
@@ -118,6 +124,13 @@ class KVTreeStore:
                 parent = self.get_route(candidate.parent_route_id)
 
             route_id = self.allocate_route_id()
+            if parent.token_logprobs and len(parent.token_logprobs) != parent.total_materialized_depth():
+                raise ValueError(
+                    "decoded parent token_logprobs must match its materialized path: "
+                    f"route_id={parent.route_id}, logprobs={len(parent.token_logprobs)}, "
+                    f"materialized_depth={parent.total_materialized_depth()}"
+                )
+            local_logprob = float(candidate.cumulative_logprob - candidate.parent_logprob)
             route = RouteState(
                 route_id=route_id,
                 stage1_root_id=candidate.stage1_root_id,
@@ -128,6 +141,11 @@ class KVTreeStore:
                 stage1_depth=parent.stage1_depth,
                 stage2_depth=parent.stage2_depth,
                 kv_view=parent.kv_view.fork(),
+                token_logprobs=(
+                    (*parent.token_logprobs, local_logprob)
+                    if parent.token_logprobs
+                    else ()
+                ),
             )
             self.register_route(route)
             next_routes.append(route)
@@ -186,6 +204,19 @@ class KVTreeStore:
             if route.kv_view.node_ids[: len(committed_node_ids)] != committed_node_ids:
                 raise ValueError("cannot promote a route outside the committed branch")
 
+            if route.token_logprobs:
+                materialized_depth = route.total_materialized_depth()
+                valid_lengths = {materialized_depth, materialized_depth + 1}
+                if len(route.token_logprobs) not in valid_lengths:
+                    raise ValueError(
+                        "promoted route token_logprobs do not match its token path: "
+                        f"route_id={route.route_id}, logprobs={len(route.token_logprobs)}, "
+                        f"valid_lengths={sorted(valid_lengths)}"
+                    )
+                route.token_logprobs = tuple(
+                    route.token_logprobs[len(committed_node_ids) :]
+                )
+
             route.kv_view = RouteKVView(prefix=new_prefix, node_ids=tuple(suffix_node_ids))
             route.materialized_leaf_node_id = suffix_node_ids[-1] if suffix_node_ids else None
             route.stage1_depth = route.stage2_depth
@@ -215,5 +246,13 @@ class KVTreeStore:
             stage1_depth=route.stage1_depth,
             stage2_depth=route.stage2_depth,
             kv_view=route.kv_view.fork(),
+            token_logprobs=(
+                (
+                    *route.token_logprobs,
+                    float(cumulative_logprob - route.cumulative_logprob),
+                )
+                if route.token_logprobs
+                else ()
+            ),
         )
         return self.register_route(cloned)

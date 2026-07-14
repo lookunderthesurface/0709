@@ -17,6 +17,7 @@ from .builders import (
 from .flashinfer_backends import SGLangFlashInferPagedDecodeBackend, SGLangRouteKVMetadata
 from .kv import KVTreeNode, KVTreeStore
 from .paged_metadata import FlashInferPagedKVMetadata, build_flashinfer_paged_kv_metadata
+from .sampling import DrafterSamplingConfig, DrafterSamplingContext
 from .sglang_runtime import (
     SGLangFlashInferFrontierModelBackend,
     SGLangMemoryPoolBundle,
@@ -47,6 +48,8 @@ __all__ = [
     "AtlasPagedDecodeSpec",
     "DecodePhase",
     "DraftPrefixState",
+    "DrafterSamplingConfig",
+    "DrafterSamplingContext",
     "FrontierDecodeOutput",
     "FrontierStepOutput",
     "FlashInferPagedKVMetadata",

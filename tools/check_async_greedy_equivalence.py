@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Mapping
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -25,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Check that k=1 async ATLAS with a first-route Target is exactly "
-            "equivalent to the Drafter's independent greedy paged AR."
+            "equivalent to the Drafter's independent greedy or seeded-sampled paged AR."
         )
     )
     parser.add_argument("--drafter-model", required=True)
@@ -45,8 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--d", type=int, default=4)
     parser.add_argument(
         "--forest-depths",
-        default="0,1,2,3,4",
-        help="Comma-separated fixed forest depths to test; every value must be in [0,d].",
+        default="live",
+        help=(
+            "Comma-separated schedules: 'live' uses the normal wall-clock forest "
+            "boundary; integers are optional semantic diagnostics in [0,d]."
+        ),
     )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=2)
@@ -62,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nccl-port", type=int, default=29500)
     parser.add_argument("--target-timeout", type=float, default=600.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--drafter-do-sample", action="store_true")
+    parser.add_argument("--drafter-temperature", type=float, default=1.0)
     parser.add_argument(
         "--deterministic-algorithms",
         action="store_true",
@@ -165,16 +171,29 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.d <= 0 or args.max_new_tokens <= 0 or args.repeats <= 0:
         raise SystemExit("d, max-new-tokens, and repeats must be positive")
-    forest_depths = [
-        int(part.strip()) for part in args.forest_depths.split(",") if part.strip()
-    ]
-    if not forest_depths or any(depth < 0 or depth > args.d for depth in forest_depths):
-        raise SystemExit("every forest depth must be between 0 and d")
+    forest_depths: list[int | None] = []
+    for raw_part in args.forest_depths.split(","):
+        part = raw_part.strip().lower()
+        if not part:
+            continue
+        if part in {"live", "none"}:
+            forest_depths.append(None)
+        else:
+            forest_depths.append(int(part))
+    if not forest_depths or any(
+        depth is not None and (depth < 0 or depth > args.d)
+        for depth in forest_depths
+    ):
+        raise SystemExit("forest schedules must be 'live' or integers between 0 and d")
+    if not math.isfinite(args.drafter_temperature) or args.drafter_temperature <= 0.0:
+        raise SystemExit("drafter-temperature must be finite and positive")
 
     reproducibility = configure_reproducibility(
         args.seed,
         deterministic_algorithms=args.deterministic_algorithms,
     )
+    reproducibility["algorithmic_sampling"] = bool(args.drafter_do_sample)
+    reproducibility["generation_reproducibility_requires_fixed_forest_depth"] = False
 
     import torch
     from transformers import AutoTokenizer
@@ -279,6 +298,9 @@ def main() -> int:
                     prompt_token_ids,
                     max_new_tokens=args.max_new_tokens,
                     eos_token_id=args.eos_token_id,
+                    do_sample=args.drafter_do_sample,
+                    generation_seed=args.seed,
+                    temperature=args.drafter_temperature,
                 )
                 torch.cuda.synchronize()
                 ar_runs.append([int(token_id) for token_id in result.generated_token_ids])
@@ -299,6 +321,9 @@ def main() -> int:
                             max_new_tokens=args.max_new_tokens,
                             eos_token_id=args.eos_token_id,
                             fallback_ar_tokens=1,
+                            generation_seed=args.seed,
+                            drafter_do_sample=args.drafter_do_sample,
+                            drafter_temperature=args.drafter_temperature,
                             fixed_forest_depth=forest_depth,
                             validate_state_alignment=True,
                         ),
@@ -344,6 +369,9 @@ def main() -> int:
                 all_exact = all_exact and depth_exact
                 depth_reports.append(
                     {
+                        "forest_schedule": (
+                            "live_wall_clock" if forest_depth is None else "fixed_diagnostic"
+                        ),
                         "fixed_forest_depth": forest_depth,
                         "exact_match_by_repeat": paired_exact,
                         "atlas_repeat_exact": atlas_repeat_exact,
@@ -372,12 +400,18 @@ def main() -> int:
 
         report = {
             "passed": bool(all_exact),
-            "claim": "k1_first_route_async_equals_drafter_greedy_ar",
+            "claim": (
+                "k1_first_route_async_equals_seeded_drafter_sampled_ar"
+                if args.drafter_do_sample
+                else "k1_first_route_async_equals_drafter_greedy_ar"
+            ),
             "drafter_model": args.drafter_model,
             "target_health": health,
             "k": 1,
             "d": args.d,
             "forest_depths": forest_depths,
+            "drafter_do_sample": bool(args.drafter_do_sample),
+            "drafter_temperature": float(args.drafter_temperature),
             "max_new_tokens": args.max_new_tokens,
             "repeats": args.repeats,
             "eos_token_id": args.eos_token_id,
@@ -395,7 +429,9 @@ def main() -> int:
         )
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
         if not all_exact:
-            raise RuntimeError("k=1 first-route ATLAS diverged from Drafter greedy AR")
+            raise RuntimeError(
+                "k=1 first-route ATLAS diverged from the matched Drafter AR trajectory"
+            )
         return 0
     finally:
         runner = None

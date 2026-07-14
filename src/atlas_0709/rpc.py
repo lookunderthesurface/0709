@@ -17,7 +17,13 @@ def target_score_to_dict(score: TargetRouteScore) -> dict[str, object]:
         "route_id": int(score.route_id),
         "token_ids": [int(token_id) for token_id in score.token_ids],
         "target_logprob": float(score.target_logprob),
-        "draft_logprob": float(score.draft_logprob),
+        # draft_logprob remains the compatibility name consumed by existing
+        # evaluators, but now means the current verified path when per-token
+        # data is available. The historical cumulative value is kept under an
+        # explicit name for promotion/debugging audits.
+        "draft_logprob": float(score.draft_path_logprob),
+        "draft_path_logprob": float(score.draft_path_logprob),
+        "legacy_cumulative_draft_logprob": float(score.draft_logprob),
         "token_logprobs": [float(value) for value in score.token_logprobs],
         "first_token_logprob": (
             None if score.first_token_logprob is None else float(score.first_token_logprob)
@@ -26,6 +32,10 @@ def target_score_to_dict(score: TargetRouteScore) -> dict[str, object]:
             None if score.selection_score is None else float(score.selection_score)
         ),
         "score_weights": [float(value) for value in score.score_weights],
+        "draft_token_logprobs": [
+            float(value) for value in score.draft_token_logprobs
+        ],
+        "draft_first_token_logprob": score.draft_first_token_logprob,
     }
 
 
@@ -85,6 +95,8 @@ class TargetServerApp:
         fallback_max_tokens = request.get("fallback_max_tokens")
         selected_path_max_tokens = request.get("selected_path_max_tokens")
         eos_token_id = request.get("eos_token_id")
+        route_sampling_seed = request.get("route_sampling_seed")
+        route_sampling_round = request.get("route_sampling_round")
         if not isinstance(prefix, list):
             raise ValueError("verify requires prefix_token_ids: list[int]")
         if not isinstance(routes, list):
@@ -103,6 +115,12 @@ class TargetServerApp:
                     else int(selected_path_max_tokens)
                 ),
                 eos_token_id=(None if eos_token_id is None else int(eos_token_id)),
+                route_sampling_seed=(
+                    None if route_sampling_seed is None else int(route_sampling_seed)
+                ),
+                route_sampling_round=(
+                    None if route_sampling_round is None else int(route_sampling_round)
+                ),
             )
         return {
             "ok": True,
@@ -140,6 +158,8 @@ class InProcessTargetClient:
         fallback_max_tokens: int | None = None,
         selected_path_max_tokens: int | None = None,
         eos_token_id: int | None = None,
+        route_sampling_seed: int | None = None,
+        route_sampling_round: int | None = None,
     ) -> dict[str, object]:
         result = self.backend.verify_payloads(
             prefix_token_ids=prefix_token_ids,
@@ -147,6 +167,8 @@ class InProcessTargetClient:
             fallback_max_tokens=fallback_max_tokens,
             selected_path_max_tokens=selected_path_max_tokens,
             eos_token_id=eos_token_id,
+            route_sampling_seed=route_sampling_seed,
+            route_sampling_round=route_sampling_round,
         )
         return {"ok": True, **target_verify_result_to_dict(result)}
 
@@ -243,6 +265,8 @@ class RemoteTargetClient:
         fallback_max_tokens: int | None = None,
         selected_path_max_tokens: int | None = None,
         eos_token_id: int | None = None,
+        route_sampling_seed: int | None = None,
+        route_sampling_round: int | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {
             "prefix_token_ids": [int(token_id) for token_id in prefix_token_ids],
@@ -254,6 +278,10 @@ class RemoteTargetClient:
             payload["selected_path_max_tokens"] = int(selected_path_max_tokens)
         if eos_token_id is not None:
             payload["eos_token_id"] = int(eos_token_id)
+        if route_sampling_seed is not None:
+            payload["route_sampling_seed"] = int(route_sampling_seed)
+        if route_sampling_round is not None:
+            payload["route_sampling_round"] = int(route_sampling_round)
         return self._post("/verify", payload)
 
     def _post(self, path: str, payload: Mapping[str, object]) -> dict[str, object]:

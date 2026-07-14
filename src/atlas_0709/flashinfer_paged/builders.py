@@ -12,6 +12,11 @@ from .frontier import (
     collect_pending_candidates,
 )
 from .kv import KVTreeStore
+from .sampling import (
+    DrafterSamplingContext,
+    batch_parent_token_candidates,
+    single_parent_token_candidates,
+)
 from .types import (
     BuildDepthsOutput,
     DecodePhase,
@@ -20,7 +25,7 @@ from .types import (
     PendingCandidate,
     RouteState,
 )
-from .utils import topk_logprobs, topk_pairs_to_python
+from .utils import topk_pairs_to_python
 
 
 def initialize_stage1_routes(
@@ -28,8 +33,13 @@ def initialize_stage1_routes(
     *,
     k: int,
     route_store: KVTreeStore,
+    sampling: DrafterSamplingContext | None = None,
 ) -> list[RouteState]:
-    token_logprobs, token_ids = topk_logprobs(draft_prefix_state.next_token_logits, k=k)
+    token_logprobs, token_ids = single_parent_token_candidates(
+        draft_prefix_state.next_token_logits,
+        k=k,
+        sampling=sampling,
+    )
     routes: list[RouteState] = []
 
     for token_id, token_logprob in topk_pairs_to_python(token_ids, token_logprobs):
@@ -44,6 +54,7 @@ def initialize_stage1_routes(
             stage1_depth=0,
             stage2_depth=0,
             kv_view=draft_prefix_state.prefix_kv_view.fork(),
+            token_logprobs=(float(token_logprob),),
         )
         routes.append(route_store.register_route(route))
     return routes
@@ -57,6 +68,7 @@ def build_tree_one_depth(
     model_backend: FrontierModelBackend,
     attention_backend: Any = None,
     phase: DecodePhase = DecodePhase.STAGE1,
+    sampling: DrafterSamplingContext | None = None,
 ) -> FrontierStepOutput:
     if len(active_routes) != k:
         raise ValueError(
@@ -69,6 +81,7 @@ def build_tree_one_depth(
         model_backend=model_backend,
         selection_policy=GlobalTopKSelection(phase=phase),
         attention_backend=attention_backend,
+        sampling=sampling,
     )
 
 
@@ -81,6 +94,7 @@ def build_tree_depths(
     model_backend: FrontierModelBackend,
     attention_backend: Any = None,
     phase: DecodePhase = DecodePhase.STAGE1,
+    sampling: DrafterSamplingContext | None = None,
 ) -> BuildDepthsOutput:
     if depth <= 0:
         raise ValueError("depth must be positive")
@@ -95,6 +109,7 @@ def build_tree_depths(
             model_backend=model_backend,
             attention_backend=attention_backend,
             phase=phase,
+            sampling=sampling,
         )
         steps.append(step)
         frontier = step.next_routes
@@ -114,6 +129,7 @@ def initialize_forest_routes(
     *,
     k: int,
     route_store: KVTreeStore,
+    sampling: DrafterSamplingContext | None = None,
 ) -> list[RouteState]:
     if len(stage1_routes) != int(stage1_last_logits.shape[0]):
         raise ValueError(
@@ -121,12 +137,16 @@ def initialize_forest_routes(
         )
 
     forest_routes: list[RouteState] = []
-    actual_k = min(int(k), int(stage1_last_logits.shape[-1]))
-    token_logprobs, token_ids = torch.topk(
-        torch.log_softmax(stage1_last_logits, dim=-1),
-        k=actual_k,
-        dim=-1,
+    relative_parent_paths = [
+        route_store.materialized_token_path(route) for route in stage1_routes
+    ]
+    token_logprobs, token_ids = batch_parent_token_candidates(
+        stage1_last_logits,
+        k=k,
+        sampling=sampling,
+        relative_parent_paths=relative_parent_paths,
     )
+    actual_k = int(token_ids.shape[-1])
     topk_pairs = topk_pairs_to_python(token_ids, token_logprobs)
     for row, stage1_route in enumerate(stage1_routes):
         for rank in range(actual_k):
@@ -142,6 +162,10 @@ def initialize_forest_routes(
                 stage1_depth=stage1_route.stage1_depth,
                 stage2_depth=0,
                 kv_view=stage1_route.kv_view.fork(),
+                token_logprobs=(
+                    *stage1_route.token_logprobs,
+                    float(token_logprob),
+                ),
             )
             forest_routes.append(route_store.register_route(route))
     return forest_routes
@@ -154,6 +178,7 @@ def build_forest_one_depth(
     route_store: KVTreeStore,
     model_backend: FrontierModelBackend,
     attention_backend: Any = None,
+    sampling: DrafterSamplingContext | None = None,
 ) -> FrontierStepOutput:
     expected = k * k
     if len(active_routes) != expected:
@@ -167,6 +192,7 @@ def build_forest_one_depth(
         model_backend=model_backend,
         selection_policy=PerStage1RootTopKSelection(phase=DecodePhase.STAGE2),
         attention_backend=attention_backend,
+        sampling=sampling,
     )
 
 
@@ -178,6 +204,7 @@ def build_forest_depths(
     route_store: KVTreeStore,
     model_backend: FrontierModelBackend,
     attention_backend: Any = None,
+    sampling: DrafterSamplingContext | None = None,
 ) -> BuildDepthsOutput:
     if depth <= 0:
         raise ValueError("depth must be positive")
@@ -191,6 +218,7 @@ def build_forest_depths(
             route_store=route_store,
             model_backend=model_backend,
             attention_backend=attention_backend,
+            sampling=sampling,
         )
         steps.append(step)
         frontier = step.next_routes
