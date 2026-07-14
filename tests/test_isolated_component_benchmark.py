@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from benchmarks.bench_atlas_0709_isolated_components import (
@@ -249,7 +248,7 @@ def test_paired_critical_path_uses_abba_and_only_boundary_syncs(monkeypatch) -> 
 
 
 def test_paired_critical_path_rejects_incomplete_abba_block() -> None:
-    with pytest.raises(ValueError, match="positive even"):
+    try:
         measure_paired_critical_path_components(
             setup_a=make_fake_state,
             step_a=advance_fake_state,
@@ -262,6 +261,10 @@ def test_paired_critical_path_rejects_incomplete_abba_block() -> None:
             iters=3,
             order_seed=0,
         )
+    except ValueError as exc:
+        assert "positive even" in str(exc)
+    else:
+        raise AssertionError("incomplete ABBA block did not raise ValueError")
 
 
 class FakeNativeReqPool:
