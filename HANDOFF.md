@@ -4,6 +4,434 @@ Read this file first when opening a new work window. It is intentionally
 action-oriented. Detailed historical notes are in `README.md` and
 `TESTING_METHODS.md`.
 
+## Current Research Decision (2026-07-14)
+
+Read this section before changing the implementation or launching a long GPU
+run. The active project is again **0709**. The 0713 fixed route-matrix/cascade
+experiment is retained as a negative-result branch, not the main direction.
+
+### Research priority
+
+The next goal is to study how tree/forest policy changes the end-to-end
+speed--quality frontier. Do not make "enable CUDA Graph" the research claim and
+do not spend the next window optimizing 0713 before the policy opportunity is
+established.
+
+The intended paper question is narrower than generic adaptive tree decoding:
+
+```text
+Under a stochastic Edge--Cloud verification deadline, which root/node should
+the weak Edge Drafter expand next, how wide/deep should it expand, and when
+should it stop, so that useful candidate quality is maximized while latency,
+wasted forest work, and persistent paged-KV cost stay within budget?
+```
+
+The promising 0709-specific mechanism is an interruptible/anytime forest plus
+the physical paged-KV lifecycle: fork/COW, partial completion, cancellation at
+a decode-depth boundary, selected-subtree promotion, and reuse across rounds.
+Plain confidence-based dynamic `k,d`, optimal tree shape, asynchronous
+draft/verify, and a generic quality--runtime knob all have close prior work.
+In particular, the next literature comparison must include EAGLE-2, Sequoia,
+OPT-Tree, Fuzzy Speculative Decoding, PEARL, and 2026 Saguaro/Speculative
+Speculative Decoding. Do not claim that 0709 is the first dynamic or
+asynchronous speculative tree.
+
+CUDA Graph, synchronization removal, route-row/page-table cleanup, and cheaper
+tail-page COW remain important **engineering enablers and fairness controls**.
+The Drafter currently uses eager forwards because
+`SGLangRunnerConfig.disable_cuda_graph=True`. Merely changing this flag is not
+a paper-level contribution. A later graph-friendly policy implementation may
+bucket logical decisions into a small set of static shapes, but policy research
+comes first. Final performance conclusions must eventually use comparable
+optimization levels because eager overhead can change which policy looks best.
+
+### Current hardware constraint and the single-GPU proxy
+
+There is currently only **one H800** available. Do not run the network Target
+and Drafter concurrently on that GPU and interpret their contended wall time as
+Edge--Cloud overlap. For the current research phase, load and measure them
+sequentially in isolation on the same GPU. This is an analytical proxy, not a
+claim about a deployed Edge--Cloud system.
+
+The production ordering matters:
+
+```text
+exposed Stage-1 tree
+-> send verification request
+-> Stage-2 forest overlaps Cloud request/verify/response
+-> select/promote/commit
+```
+
+Define the isolated medians for one round as:
+
+```text
+T_tree       = complete Stage-1 build-tree time (exposed before the request)
+T_forest     = complete d-depth Stage-2 forest time (potential overlap window)
+T_verify     = Target masked verify + Target KV commit
+T_cloud(RTT) = T_verify + total request/response RTT and any RPC overhead
+```
+
+Use the following first-order model:
+
+```text
+target_fully_hidden = T_cloud(RTT) <= T_forest
+exposed_cloud_wait  = max(0, T_cloud(RTT) - T_forest)
+round_critical_path ~= T_tree + max(T_forest, T_cloud(RTT))
+                       + Edge selection/promotion/control
+```
+
+The user expects a real weak Edge to take longer to perform four Drafter decode
+depths than the Cloud round trip plus Target verify. Under that condition the
+Target path is treated as hidden while researching tree policy. Test and report
+the inequality; do not silently assume it. The isolated H800 proxy currently
+omits real network, queueing, and heterogeneous-device effects. Sweep assumed
+total RTT values now, then validate the model on the real Edge--Cloud platform
+only after the tree strategy is stable.
+
+`T_forest`, rather than `T_tree + T_forest`, is the correct hiding window.
+Full-depth `T_forest` is an upper-bound window when the forest can be cancelled
+early. Also retain each per-depth timing so an anytime policy can reason about
+partial forests.
+
+### Evidence already obtained
+
+These H800 results are preliminary evidence and hypothesis generators, not
+publication claims:
+
+```text
+k=3, d=4, prefix=8192, FP16, FlashInfer 0.6.12
+
+matched batch-3 AR x4:       26.967 ms mean
+0709 Stage-1 tree:           27.873 ms mean   (+3.36%)
+matched batch-9 AR x4:       30.412 ms mean
+0709 Stage-2 forest:         32.385 ms mean   (+6.49%)
+Target masked tree verify:   24.224 ms
+Target FI AR1 / AR2:         18.402 / 34.734 ms
+Target linear verify:        28.484 ms
+```
+
+Thus the measured same-H800 `T_verify` is below the full four-depth
+`T_forest`; before adding RPC overhead the margin is about 8.16 ms. This only
+predicts full hiding for total added RTT/overhead within that margin on this
+proxy. A weak real Edge may provide a larger forest window.
+
+The serial GSM8K 100-example screen showed a real candidate quality--speed
+signal, mostly controlled by fallback:
+
+```text
+fallback disabled:   69% EM, 77.80 output tok/s
+threshold -1.00:     81% EM, 74.53 output tok/s
+threshold -0.75:     84% EM, 71.10 output tok/s
+threshold -0.50:     87% EM, 65.05 output tok/s
+threshold -0.25:     88% EM, 54.77 output tok/s
+```
+
+The path-weight-alpha screen produced only 67--71% EM at about 77.5--77.9
+tok/s. With 100 examples that spread is not enough to identify a winner.
+Treat fallback as the stronger current hypothesis and alpha as unresolved.
+Never tune on the GSM8K test subset and then present the same subset as final
+evidence; create a development split, freeze policy, and use the full test set
+for the final comparison.
+
+Serial core profiling attributed approximately 59.63% of time to the Drafter
+and 40.32% to the Target, with negligible controller residual under the current
+accounting. This supports studying overlap but does not replace isolated or
+real-platform measurements.
+
+The 0713 route-matrix branch correctly implements shared-prefix/private-suffix
+attention with LSE merge, but it did not beat the fair ordinary shared-page-
+table baseline at the relevant route count. At `R=16`, fair ordinary versus
+current 0713 was 115.200 versus 123.040 us with cache eviction, and 130.176
+versus 155.728 us with a hot cache. Route-matrix attention became favorable
+only at much higher route counts (for example `R=27` in the synthetic sweep).
+Keep 0713 for reference/high-route-count experiments; do not replace 0709 with
+it now.
+
+### Exact and relaxed modes must remain separate
+
+Standard lossless speculative decoding preserves the Target distribution; in
+that mode the policy should change speed/acceptance, not output quality. The
+current 0709 weighted Target path selection and fallback implement a relaxed
+best-path mode and can change the output distribution. Its speed--quality
+Pareto is scientifically meaningful, but it must not be described as lossless
+or distribution-equivalent.
+
+For future experiments, report two explicitly named modes if both are kept:
+
+```text
+exact/lossless: standard acceptance or sampling; quality should be invariant
+relaxed:        best-path/fallback policy; report quality and distribution drift
+```
+
+### Immediate next-window plan: policy feasibility gate
+
+Before implementing a learned/online policy, establish that per-request or
+per-round adaptation has useful headroom:
+
+1. Add/verify per-round logging for draft entropy, top-1/top-2 margin,
+   cumulative route probability, Target-selected root/rank, accepted/committed
+   tokens, useful and discarded forest nodes, completed forest depths, Target
+   latency, route/KV/COW cost, and task result.
+2. On a development set, run controlled fixed-policy sweeps over `k`, `d`,
+   forest width/budget/depth cap, path scoring, and fallback threshold. Change
+   one variable at a time first and preserve an immutable output directory per
+   setting.
+3. Combine isolated `T_tree`, per-depth `T_forest`, and `T_verify` with assumed
+   RTT values to estimate the ideal Edge--Cloud critical path. Report raw
+   component times as well as the estimate.
+4. Construct a hindsight oracle that chooses the best policy per prompt/round
+   under a latency or GPU-work budget. Compare its Pareto frontier with the best
+   single fixed policy.
+5. Continue to an online deadline-aware controller only if the oracle provides
+   a material improvement beyond measurement noise and its decisions are
+   predictable from features available before Target returns.
+6. After the strategy is stable, implement the necessary eager/CUDA-Graph and
+   KV/runtime optimizations, then repeat final measurements on a real weak Edge
+   plus Cloud Target with controlled RTT.
+
+A candidate policy objective is:
+
+```text
+maximize E[task/output quality]
+         - lambda * E[end-to-end latency]
+         - mu * E[wasted forest GPU work / KV pages]
+```
+
+or, more cleanly for evaluation, maximize quality subject to fixed p95 latency
+and GPU-seconds/token budgets. Compare Pareto frontiers at equal quality, equal
+latency, and equal compute instead of presenting only one operating point.
+
+## Drafter Hot-Path Completion (2026-07-14)
+
+The four requested Drafter engineering items are implemented, pushed, and
+validated on Herta at `4cace1c57a700403874b0884fbc2ff5528e618df`.
+Do not restart these changes from scratch. The relevant commit sequence is:
+
+```text
+0f9f8eb  Add Drafter hot-path counters and paged metadata builder
+095b2ab  Fix paged metadata test fixture
+f2e36a5  Use physical page metadata in Drafter attention
+802bf99  Add page-metadata logits traces
+e51953a  Avoid redundant partial-tail COW copies
+732b68e  Update Drafter request rows incrementally
+6a581ef  Batch Drafter frontier selection transfers
+c3cb670  Add matched Drafter hot-path benchmarks
+dab52c3  Remove Drafter bridge scalar synchronizations
+f71275d  Make Drafter transfer accounting explicit
+4cace1c  Fix Target scoring test fixture
+```
+
+### What is now true
+
+- Page-size-16 attention metadata is built from validated physical slot paths.
+  `kv_indptr` counts physical pages, `kv_page_indices` contains physical page
+  ids, and `kv_last_page_len` records each route's valid final-page length.
+  CUDA layout checks use `torch._assert_async`; a runtime without that API now
+  fails explicitly instead of silently introducing a host synchronization.
+- GPU frontier selection preserves Global/per-root top-k and the deterministic
+  `(score desc, parent route asc, rank asc, token asc)` tie order. All selected
+  candidate fields are packed into one D2H transfer per depth. Standard
+  production decode has zero additional bridge transfers per depth.
+- Partial-tail COW is keyed by a CPU writer lease that follows prefix slices,
+  fork/reconcile, private COW pages, page transitions, promotion, retain, and
+  clear. Prefix slices ending at different offsets of the same physical page
+  share one lease, so the first fork performs N-1 copies and private writers do
+  not copy again until they enter a different shared partial page.
+- Req rows track `written_length` and a retry-safe dirty start. An inherited
+  ordinary decode writes one new slot. Fresh sibling rows require a full
+  initialization; a reused row after COW patches only the changed tail plus the
+  appended slot. Successful-only counters separate full-init, append, and COW
+  patch elements.
+- Newly allocated page ids stay on GPU during decode. Ownership ids are
+  materialized in one batch only at prune/report boundaries. Prefix metadata
+  and page-reference materialization are also phase-boundary transfers, not
+  per-depth decode transfers.
+
+The remaining visible transfer inventory must be described precisely:
+
+```text
+per tree/forest depth:
+  frontier.py packed candidate materialization       1 batched D2H
+  SGLangRoutePoolBridge production hot path           0 D2H
+
+tree/forest initialization:
+  initial top-k token/score materialization           1 batched D2H
+
+commit/prune/report boundaries:
+  prefix/page ownership/reference metadata            batched D2H as needed
+```
+
+`SGLANG_DEBUG_MEMORY_POOL` must remain disabled for the no-extra-sync result;
+upstream allocator debug assertions may synchronize. The repository counters
+are not a CUPTI/Nsight interceptor for third-party internals. Do not claim that
+the whole round has only one synchronization: the proven statement is one
+candidate D2H batch per decode depth in the standard production path.
+
+### Correctness and regression evidence
+
+Herta ran all test functions in the seven current test modules with the atlas
+environment: **42/42 passed**. `compileall` and `git diff --check` passed.
+Ruff is not installed in that environment and was not installed because this
+task forbids adding dependencies.
+
+The current real 1B smoke used `prefix=15, k=3, d=4, page=16`, normal physical
+page metadata, and an independent HF full-history comparison. Tree, forest,
+and the post-commit forest step all passed:
+
+```text
+tree:        max abs diff 0.0546875, every step top-1 match rate 1.0
+forest:      max abs diff 0.0517578125, every step top-1 match rate 1.0
+post-commit: max abs diff 0.0312500, top-1 match rate 1.0
+promotion:   committed 4 KV tokens, retained 3 routes,
+             released 12 req rows and 17 KV pages
+bridge transfers at every tree/forest depth: 0 batches / 0 elements
+```
+
+Raw output:
+
+```text
+/home/hwc/workspace/0701/0709_outputs/sync_4cace1c/prefix15_hf.json
+```
+
+Earlier page-size A/B traces remain at:
+
+```text
+/home/hwc/workspace/0701/0709_outputs/page_metadata_802bf99_boundaries
+/home/hwc/workspace/0701/0709_outputs/page_metadata_802bf99_long8192
+```
+
+For the 8192-token trace, page and legacy token metadata retain the same top-1
+and route/token/rank selection structure. Float logits/scores differ within
+the recorded tolerance. Use `summary_structural.json`; the older `summary.json`
+also compared cumulative float scores and must not be described as a route
+structure mismatch.
+
+### Formal matched benchmark
+
+The fixed condition was `k=3, d=4, prefix=8192, FP16, page=16`, warmup 1,
+three measured iterations in each of **three independent processes**. Prefill
+and setup are excluded from timing and counters. Tree is compared with batch-3
+AR for four steps; forest is compared with batch-9 AR for four steps. Across
+the nine raw samples:
+
+```text
+workload                         mean ms   median ms   ratio to matched AR
+matched batch-3 AR x4              27.533      27.558       1.000x
+Stage-1 tree x4                    28.868      28.954       1.048x
+matched batch-9 AR x4              29.742      29.724       1.000x
+Stage-2 forest x4                  31.671      31.671       1.065x
+```
+
+Independent-process means were:
+
+```text
+run 1: matched-tree 27.914, tree 29.331, matched-forest 30.221, forest 32.188
+run 2: matched-tree 27.569, tree 28.940, matched-forest 29.746, forest 31.664
+run 3: matched-tree 27.116, tree 28.332, matched-forest 29.258, forest 31.162
+```
+
+Aggregate per-depth means/medians were:
+
+```text
+depth                  1              2              3              4
+matched tree AR   7.426/7.473    6.698/6.671    6.723/6.708    6.641/6.643
+tree              7.661/7.717    7.065/7.069    7.078/7.085    7.018/7.027
+matched forest AR 7.691/7.719    7.332/7.351    7.340/7.320    7.334/7.358
+forest            8.004/8.027    7.866/7.862    7.903/7.886    7.850/7.869
+```
+
+The JSON files contain all raw total and per-depth samples, plus mean/median
+counter samples:
+
+```text
+/home/hwc/workspace/0701/0709_outputs/matched_4cace1c/run1.json
+/home/hwc/workspace/0701/0709_outputs/matched_4cace1c/run2.json
+/home/hwc/workspace/0701/0709_outputs/matched_4cace1c/run3.json
+```
+
+For one tree/forest iteration, counters are deterministic across the three
+processes:
+
+```text
+                              tree x4       forest x4
+legacy-equivalent token indices   98,334        295,146
+physical page indices              6,156         18,468
+bridge D2H batches                      0              0
+candidate D2H batches                   4              4
+COW pages / tokens                   4 / 8        17 / 90
+req-row elements                    57,364        163,978
+  full-init elements                57,359        163,962
+  append elements                        5             16
+  COW-patch elements                     0              0
+```
+
+Thus physical metadata uses 93.74% fewer indices than token metadata. The
+combined tree+forest req-row writes are 221,342 elements versus the old
+full-rewrite estimate of 393,480, a 43.75% reduction. Necessary fresh-fork row
+initialization remains O(sequence length); inherited ordinary appends are O(1).
+COW patch count is zero in this exact route ordering because the reused row is
+the source writer and fresh siblings are fully initialized, but dedicated
+failure/retry and dirty-tail tests cover that path.
+
+The old single-process `981f5c2` harness reported tree 28.290 ms and forest
+33.281 ms. The current nine-sample means are respectively 2.04% slower and
+4.84% faster, but that older run lacked the new fair matched-AR workloads and
+multi-process repetition. Treat it only as a noisy historical before/after,
+not a causal performance claim.
+
+### Reproducible Herta commands and operational notes
+
+For every command, keep writes in `/home/hwc/workspace/0701`. Herta Git needs
+the user-provided `http_proxy` and `https_proxy` exports in that shell. Do not
+commit the credentials, persist them in Git config, or modify another user's
+directory.
+
+The smoke invocation was:
+
+```bash
+PROJECT_ROOT=/home/hwc/workspace/0701/0709
+cd "$PROJECT_ROOT"
+pwd
+source /home/hwc/miniconda3/etc/profile.d/conda.sh
+conda activate atlas
+export PYTHONPATH="$PROJECT_ROOT/src"
+test -f "$PROJECT_ROOT/tools/smoke_flashinfer_paged_tree_forest.py"
+python "$PROJECT_ROOT/tools/smoke_flashinfer_paged_tree_forest.py" \
+  --model /home/hwc/models/Llama-3.2-1B-Instruct \
+  --prompt-token-ids 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --k 3 --d 4 --page-size 16 --context-length 8192 \
+  --mem-fraction-static 0.65 --max-running-requests 128 \
+  --max-total-tokens 65536 --check-hf-logits \
+  --json-out /home/hwc/workspace/0701/0709_outputs/sync_4cace1c/prefix15_hf.json
+```
+
+The matched benchmark command is the same for `run1.json`, `run2.json`, and
+`run3.json`, each launched as a new process:
+
+```bash
+PROJECT_ROOT=/home/hwc/workspace/0701/0709
+cd "$PROJECT_ROOT"
+pwd
+source /home/hwc/miniconda3/etc/profile.d/conda.sh
+conda activate atlas
+export PYTHONPATH="$PROJECT_ROOT/src"
+test -f "$PROJECT_ROOT/benchmarks/bench_atlas_0709_isolated_components.py"
+python "$PROJECT_ROOT/benchmarks/bench_atlas_0709_isolated_components.py" \
+  --drafter-model /home/hwc/models/Llama-3.2-1B-Instruct \
+  --target-model /home/hwc/models/Meta-Llama-3.1-8B-Instruct \
+  --k 3 --d 4 --prefix-len 8192 --page-size 16 --dtype float16 \
+  --prefill-chunk-size 8192 --mem-fraction-static 0.65 \
+  --max-running-requests 256 --max-total-tokens 65536 \
+  --warmup 1 --iters 3 --skip-verify \
+  --json-out /home/hwc/workspace/0701/0709_outputs/matched_4cace1c/run1.json
+```
+
+Remaining engineering caveats: CUDA Graph is still intentionally disabled;
+phase-boundary ownership materialization remains; generic/non-SGLang allocators
+and arbitrary caller-provided output slots would need an explicit new-page
+uniqueness contract; and an Nsight/CUPTI run is still required before making an
+absolute claim about all third-party internal synchronizations.
+
 ## 0. Start Here: Every New Terminal
 
 Never assume the shell was opened in the project directory. Define the root,
@@ -43,11 +471,15 @@ Drafter:  /home/hwc/models/Llama-3.2-1B-Instruct
 Target:   /home/hwc/models/Meta-Llama-3.1-8B-Instruct
 MTBench:  /home/hwc/workspace/thirdparty/FastChat/fastchat/llm_judge/data/mt_bench/question.jsonl
 GSM8K:    /home/hwc/workspace/thirdparty/grade-school-math/grade_school_math/data/test.jsonl
-Results:  /home/hwc/workspace/0709_outputs
+Results:  /home/hwc/workspace/0701/0709_outputs
 ```
 
 The result directory is outside `0709`, so copying the project does not copy
 large benchmark artifacts. From the project root, use `../0709_outputs/...`.
+Herta is shared by multiple users. Source and result writes for this work must
+stay under `/home/hwc/workspace/0701`; do not inspect, alter, or clean another
+user's workspace. The two explicitly listed read-only model paths are outside
+that workspace by design.
 
 The previously recorded Target service PID is `277743`. If the Target service
 must be restarted, clean up the old process first:
@@ -90,6 +522,13 @@ Transformers 5.8.1
 ```
 
 ## 3. Production Async Flow
+
+**Current single-GPU warning:** keep the commands in this section for
+functional testing and future multi-device/real-platform validation. They are
+not the current performance protocol. With only one H800, use the isolated
+sequential procedure in Section 8 and the timing model at the top of this file.
+Same-GPU process overlap measures resource contention, not the intended weak
+Edge plus Cloud deployment.
 
 The default algorithm is:
 
@@ -410,7 +849,8 @@ or reuse the same output directory.
 
 ## 8. Speed Tests and Fairness Rules
 
-For component timing, use:
+For the current one-H800 research phase, component timing is the preferred
+performance protocol. Stop any same-GPU Target server, then use:
 
 ```bash
 python benchmarks/bench_atlas_0709_isolated_components.py \
@@ -436,6 +876,41 @@ forest totals plus each depth. It must not compare one build-tree step with
 AR four-token generation. Compare a complete `d`-step tree/forest workload
 against a matched AR workload. For performance claims, use real SGLang +
 FlashInfer metadata and never call HF/SDPA an ATLAS shared-KV result.
+
+The benchmark deliberately destroys the Drafter runtime and clears CUDA state
+before loading the Target. Its `target_verify` timing includes Target KV commit
+but not network RTT. Extract the hiding model without rerunning either model:
+
+```bash
+python - <<'PY'
+import json
+
+path = "/home/hwc/workspace/0701/0709_outputs/atlas_0709_isolated_components.json"
+with open(path) as f:
+    report = json.load(f)
+
+tree_ms = report["build_tree"]["total"]["median_ms"]
+forest_ms = report["build_forest"]["total"]["median_ms"]
+verify_ms = report["target_verify"]["median_ms"]
+
+print(f"T_tree   = {tree_ms:.3f} ms (exposed)")
+print(f"T_forest = {forest_ms:.3f} ms (overlap window)")
+print(f"T_verify = {verify_ms:.3f} ms (includes Target KV commit)")
+for total_rtt_ms in (0, 1, 5, 10, 20):
+    cloud_ms = verify_ms + total_rtt_ms
+    wait_ms = max(0.0, cloud_ms - forest_ms)
+    print(
+        f"RTT={total_rtt_ms:>2} ms  cloud={cloud_ms:7.3f} ms  "
+        f"hidden={str(cloud_ms <= forest_ms):5s}  exposed_wait={wait_ms:7.3f} ms"
+    )
+PY
+```
+
+This produces an analytical overlap estimate only. It does not include real
+Edge slowdown, RPC serialization, Cloud queueing, interference, cancellation
+latency, or network variance. Preserve the raw per-depth samples so the later
+deadline-aware policy can be evaluated without pretending that a full forest
+always completes.
 
 The real route-KV smoke test is:
 
