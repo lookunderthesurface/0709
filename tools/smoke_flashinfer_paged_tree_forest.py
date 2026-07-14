@@ -62,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json-out", default=None)
     parser.add_argument(
+        "--logits-tensor-out",
+        default=None,
+        help="Optional torch.save trace for direct legacy/page logits comparison.",
+    )
+    parser.add_argument(
         "--check-hf-logits",
         action="store_true",
         help="Load a second HF model and compare every tree/forest frontier against full-history logits.",
@@ -433,6 +438,27 @@ def main() -> int:
                 encoding="utf-8",
             )
             print(f"[json] wrote {output}", flush=True)
+        if args.logits_tensor_out:
+            output = Path(args.logits_tensor_out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "tree": [
+                        step.decode_output.next_token_logits.detach().cpu()
+                        for step in tree.steps
+                    ],
+                    "forest": (
+                        [
+                            step.decode_output.next_token_logits.detach().cpu()
+                            for step in forest.steps
+                        ]
+                        if forest is not None
+                        else None
+                    ),
+                },
+                output,
+            )
+            print(f"[tensor] wrote {output}", flush=True)
         if alignment is not None and not alignment["passed"]:
             raise RuntimeError(f"route logits are not aligned: {alignment}")
     finally:
