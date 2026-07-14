@@ -49,7 +49,7 @@ def test_layout_validation_rejects_unaligned_or_noncontiguous_slots() -> None:
     invalid_paths = [
         torch.tensor([161, 162, 163], dtype=torch.long),
         torch.tensor([160, 161, 165], dtype=torch.long),
-        torch.tensor([160 + index for index in range(16)] + [192], dtype=torch.long),
+        torch.tensor([160 + index for index in range(16)] + [193], dtype=torch.long),
     ]
     for path in invalid_paths:
         try:
