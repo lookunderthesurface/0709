@@ -1368,6 +1368,7 @@ def main() -> int:
                     iters=args.iters,
                 )
                 report["matched_drafter_ar_tree_workload"] = {
+                    "comparison_role": "atlas_control_path_diagnostic_not_native_ar",
                     "batch_size": int(args.k),
                     "decode_steps": int(args.d),
                     "selection": "independent_per_route_greedy_top1",
@@ -1391,6 +1392,9 @@ def main() -> int:
                     iters=args.iters,
                 )
                 report["build_tree"] = tree.to_dict()
+                report["build_tree"]["comparison_role"] = (
+                    "sequential_unpaired_component_diagnostic"
+                )
                 report["build_tree"]["mean_over_drafter_ar1"] = (
                     tree.total.mean_ms / drafter_ar.mean_ms
                 )
@@ -1454,6 +1458,7 @@ def main() -> int:
                         "model_input_tokens": int(args.k * args.d),
                         "initial_state_source": "same_atlas_tree_frontier",
                         "gpu_resident_greedy": True,
+                        "initial_input_ids_staged_on_gpu_before_timing": True,
                         "route_materialization": False,
                         "candidate_host_transfer": False,
                         "setup_and_prefill_included": False,
@@ -1468,6 +1473,7 @@ def main() -> int:
                         "model_input_tokens": int(args.k * args.d),
                         "setup_and_prefill_included": False,
                         "initial_req_rows_and_initial_tail_cow_excluded": True,
+                        "frontier_input_ids_built_from_routes_inside_timing": True,
                         **paired_tree.arm_b.to_dict(),
                     }
                     report[tree_pair_key] = {
@@ -1477,6 +1483,10 @@ def main() -> int:
                         "paired_comparison": dict(paired_tree.paired_comparison),
                         "arm_a_report_key": tree_native_key,
                         "arm_b_report_key": tree_ready_key,
+                        "comparison_scope": (
+                            "decode_critical_path_including_algorithm_control_plane"
+                        ),
+                        "pure_model_kernel_comparison": False,
                     }
                     tree_pair_total = paired_tree.paired_comparison["total"]
                     tree_pair_ratio = float(
@@ -1528,6 +1538,7 @@ def main() -> int:
                     iters=args.iters,
                 )
                 report["matched_drafter_ar_forest_workload"] = {
+                    "comparison_role": "atlas_control_path_diagnostic_not_native_ar",
                     "batch_size": int(args.k * args.k),
                     "decode_steps": int(args.d),
                     "selection": "independent_per_route_greedy_top1",
@@ -1552,6 +1563,9 @@ def main() -> int:
                     iters=args.iters,
                 )
                 report["build_forest"] = forest.to_dict()
+                report["build_forest"]["comparison_role"] = (
+                    "sequential_unpaired_component_diagnostic"
+                )
                 report["build_forest"]["mean_over_drafter_ar1"] = (
                     forest.total.mean_ms / drafter_ar.mean_ms
                 )
@@ -1620,6 +1634,7 @@ def main() -> int:
                         "model_input_tokens": int(args.k * args.k * args.d),
                         "initial_state_source": "same_atlas_forest_frontier",
                         "gpu_resident_greedy": True,
+                        "initial_input_ids_staged_on_gpu_before_timing": True,
                         "route_materialization": False,
                         "candidate_host_transfer": False,
                         "setup_and_prefill_included": False,
@@ -1634,6 +1649,7 @@ def main() -> int:
                         "model_input_tokens": int(args.k * args.k * args.d),
                         "setup_and_prefill_included": False,
                         "initial_req_rows_and_initial_tail_cow_excluded": True,
+                        "frontier_input_ids_built_from_routes_inside_timing": True,
                         **paired_forest.arm_b.to_dict(),
                     }
                     report[forest_pair_key] = {
@@ -1643,6 +1659,10 @@ def main() -> int:
                         "paired_comparison": dict(paired_forest.paired_comparison),
                         "arm_a_report_key": forest_native_key,
                         "arm_b_report_key": forest_ready_key,
+                        "comparison_scope": (
+                            "decode_critical_path_including_algorithm_control_plane"
+                        ),
+                        "pure_model_kernel_comparison": False,
                     }
                     forest_pair_total = paired_forest.paired_comparison["total"]
                     forest_pair_ratio = float(
