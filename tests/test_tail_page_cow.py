@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from atlas_0709.flashinfer_paged.sglang_runtime import SGLangRoutePoolBridge
+from atlas_0709.flashinfer_paged.types import PrefixKVView, RouteKVView, RouteState
 
 
 class FakeKVCache:
@@ -57,7 +58,7 @@ def make_bridge(page_size: int = 4) -> SGLangRoutePoolBridge:
     )
 
 
-def test_partial_tail_is_copied_per_route() -> None:
+def test_shared_partial_tail_copies_only_one_writer() -> None:
     bridge = make_bridge()
     shared_tail = torch.tensor([0, 1, 2], dtype=torch.long)
     routes = [SimpleNamespace(route_id=1), SimpleNamespace(route_id=2)]
@@ -67,24 +68,116 @@ def test_partial_tail_is_copied_per_route() -> None:
         [shared_tail, shared_tail],
     )
 
-    assert copied[0].tolist() == [40, 41, 42]
-    assert copied[1].tolist() == [44, 45, 46]
-    assert bridge.cow_pages_copied == 2
-    assert bridge.cow_tokens_copied == 6
+    assert copied[0] is shared_tail
+    assert copied[1].tolist() == [40, 41, 42]
+    assert bridge.cow_pages_copied == 1
+    assert bridge.cow_tokens_copied == 3
     assert bridge.token_to_kv_pool_allocator.kv_cache.moves == [
         ([40, 41, 42], [0, 1, 2]),
-        ([44, 45, 46], [0, 1, 2]),
     ]
 
 
-def test_full_tail_page_remains_shared() -> None:
+def test_n_shared_partial_tail_writers_copy_n_minus_one_pages() -> None:
+    bridge = make_bridge()
+    shared_tail = torch.tensor([0, 1], dtype=torch.long)
+    routes = [SimpleNamespace(route_id=index) for index in (1, 2, 3)]
+
+    copied = bridge._copy_partial_tail_pages(
+        routes,
+        [shared_tail, shared_tail, shared_tail],
+    )
+
+    assert copied[0] is shared_tail
+    assert copied[1].tolist() == [40, 41]
+    assert copied[2].tolist() == [44, 45]
+    assert bridge.cow_pages_copied == 2
+    assert bridge.cow_tokens_copied == 4
+
+
+def test_same_partial_page_with_different_valid_lengths_is_copied() -> None:
+    bridge = make_bridge()
+    short_tail = torch.tensor([0, 1], dtype=torch.long)
+    long_tail = torch.tensor([0, 1, 2], dtype=torch.long)
+    routes = [SimpleNamespace(route_id=1), SimpleNamespace(route_id=2)]
+
+    copied = bridge._copy_partial_tail_pages(routes, [short_tail, long_tail])
+
+    assert copied[0] is short_tail
+    assert copied[1].tolist() == [40, 41, 42]
+    assert bridge.cow_pages_copied == 1
+    assert bridge.cow_tokens_copied == 3
+    assert bridge.token_to_kv_pool_allocator.kv_cache.moves == [
+        ([40, 41, 42], [0, 1, 2]),
+    ]
+
+
+def test_distinct_partial_tail_pages_are_not_copied_in_batch() -> None:
+    bridge = make_bridge()
+    first = torch.tensor([0, 1, 2], dtype=torch.long)
+    second = torch.tensor([4, 5, 6], dtype=torch.long)
+    routes = [SimpleNamespace(route_id=1), SimpleNamespace(route_id=2)]
+
+    copied = bridge._copy_partial_tail_pages(routes, [first, second])
+
+    assert copied[0] is first
+    assert copied[1] is second
+    assert bridge.cow_pages_copied == 0
+    assert bridge.cow_tokens_copied == 0
+    assert bridge.token_to_kv_pool_allocator.kv_cache.moves == []
+
+
+def test_private_cow_tails_append_without_being_copied_again() -> None:
+    bridge = make_bridge(page_size=8)
+    shared_tail = torch.tensor([0, 1, 2], dtype=torch.long)
+    routes = [SimpleNamespace(route_id=1), SimpleNamespace(route_id=2)]
+
+    copied = bridge._copy_partial_tail_pages(routes, [shared_tail, shared_tail])
+    assert bridge.cow_pages_copied == 1
+
+    continued = [
+        torch.cat((copied[0], torch.tensor([3], dtype=torch.long))),
+        torch.cat((copied[1], torch.tensor([83], dtype=torch.long))),
+    ]
+    reused = bridge._copy_partial_tail_pages(routes, continued)
+
+    assert reused[0] is continued[0]
+    assert reused[1] is continued[1]
+    assert bridge.cow_pages_copied == 1
+    assert bridge.cow_tokens_copied == 3
+    assert bridge.token_to_kv_pool_allocator.kv_cache.moves == [
+        ([80, 81, 82], [0, 1, 2]),
+    ]
+
+
+def test_cow_branches_can_write_different_kv_without_contamination() -> None:
+    bridge = make_bridge()
+    shared_tail = torch.tensor([0, 1, 2], dtype=torch.long)
+    routes = [SimpleNamespace(route_id=1), SimpleNamespace(route_id=2)]
+
+    copied = bridge._copy_partial_tail_pages(routes, [shared_tail, shared_tail])
+    kv_cache = bridge.token_to_kv_pool_allocator.kv_cache
+    first_output_slot = int(copied[0][-1]) + 1
+    second_output_slot = int(copied[1][-1]) + 1
+    kv_cache.values[first_output_slot] = 111.0
+    kv_cache.values[second_output_slot] = 222.0
+
+    assert copied[0].tolist() == [0, 1, 2]
+    assert copied[1].tolist() == [40, 41, 42]
+    assert kv_cache.values[copied[0]].tolist() == [0.0, 1.0, 2.0]
+    assert kv_cache.values[copied[1]].tolist() == [0.0, 1.0, 2.0]
+    assert float(kv_cache.values[first_output_slot]) == 111.0
+    assert float(kv_cache.values[second_output_slot]) == 222.0
+
+
+def test_shared_full_tail_page_does_not_need_cow() -> None:
     bridge = make_bridge()
     full_page = torch.tensor([0, 1, 2, 3], dtype=torch.long)
-    route = SimpleNamespace(route_id=1)
+    routes = [SimpleNamespace(route_id=1), SimpleNamespace(route_id=2)]
 
-    copied = bridge._copy_partial_tail_pages([route], [full_page])
+    copied = bridge._copy_partial_tail_pages(routes, [full_page, full_page])
 
     assert copied[0] is full_page
+    assert copied[1] is full_page
     assert bridge.cow_pages_copied == 0
 
 
@@ -97,6 +190,45 @@ def test_batch1_ar_does_not_copy_a_partial_tail() -> None:
 
     assert copied[0] is partial_page
     assert bridge.cow_pages_copied == 0
+
+
+def test_page_reference_counts_and_selected_promotion_release() -> None:
+    bridge = make_bridge()
+    bridge.set_prefix_slots(torch.tensor([0, 1], dtype=torch.long))
+    selected = RouteState(
+        route_id=1,
+        stage1_root_id=1,
+        parent_route_id=None,
+        materialized_leaf_node_id=1,
+        pending_token_id=7,
+        cumulative_logprob=0.0,
+        stage1_depth=1,
+        stage2_depth=0,
+        kv_view=RouteKVView(
+            prefix=PrefixKVView(committed_length=2),
+            node_ids=(1,),
+        ),
+    )
+    bridge.route_slot_paths = {
+        1: torch.tensor([0, 1, 40], dtype=torch.long),
+        2: torch.tensor([0, 1, 40, 41], dtype=torch.long),
+        3: torch.tensor([0, 1, 44], dtype=torch.long),
+    }
+    bridge.owned_page_ids.update({10, 11})
+
+    assert bridge.page_reference_counts() == {0: 4, 10: 2, 11: 1}
+
+    bridge.commit_route_as_prefix(selected)
+    bridge.retain_route_rows([2])
+    assert bridge.page_reference_counts() == {0: 2, 10: 2}
+    assert bridge.owned_page_ids == {0, 10, 11}
+
+    released = bridge.release_unreferenced_node_slots([])
+
+    assert bridge.page_reference_counts() == {0: 2, 10: 2}
+    assert released == 1
+    assert bridge.owned_page_ids == {0, 10}
+    assert bridge.token_to_kv_pool_allocator.freed == [44]
 
 
 def test_req_row_full_rewrite_counters_record_written_elements() -> None:

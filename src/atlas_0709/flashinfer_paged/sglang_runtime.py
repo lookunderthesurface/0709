@@ -271,6 +271,34 @@ class SGLangRoutePoolBridge:
         self.prefix_slot_ids = full_slot_path
         return full_slot_path
 
+    def page_reference_counts(self) -> dict[int, int]:
+        """Return read-only page reference counts for ownership validation.
+
+        A reference is counted once per physical path view, not once per token
+        slot.  The committed prefix contributes one reference to every page it
+        reaches, and every retained route path contributes another.  Physical
+        release remains the mark-and-sweep operation below; this helper is for
+        invariants, tests, and diagnostics only.  Read-only references do not
+        by themselves determine which active route holds the tail writer lease.
+        """
+
+        counts: dict[int, int] = {}
+
+        def add_path(slot_path: torch.Tensor | None) -> None:
+            if slot_path is None or int(slot_path.numel()) == 0:
+                return
+            page_ids = {
+                int(slot_id) // self.page_size
+                for slot_id in _int_list(slot_path)
+            }
+            for page_id in page_ids:
+                counts[page_id] = counts.get(page_id, 0) + 1
+
+        add_path(self.prefix_slot_ids)
+        for slot_path in self.route_slot_paths.values():
+            add_path(slot_path)
+        return dict(sorted(counts.items()))
+
     def release_unreferenced_node_slots(self, live_node_ids: Sequence[int]) -> int:
         """Release pages that contain no committed-prefix or live-route slots.
 
@@ -445,19 +473,45 @@ class SGLangRoutePoolBridge:
         routes: Sequence[RouteState],
         slot_paths: Sequence[torch.Tensor],
     ) -> list[torch.Tensor]:
+        if len(routes) != len(slot_paths):
+            raise ValueError("routes and slot_paths must have the same length")
         if len(routes) <= 1:
             return list(slot_paths)
-        partial: list[tuple[int, torch.Tensor, int]] = []
+
+        # Only active writers that point at the same partial physical page need
+        # copy-on-write.  Distinct partial pages are already private.  For N
+        # writers sharing one page, one writer can safely append at its first
+        # unused offset while the remaining N-1 writers get private copies.
+        # Grouping solely by page also handles aliased views with different
+        # valid tail lengths; each copied view preserves its own valid length.
+        partial_groups: dict[int, list[tuple[int, torch.Tensor, int]]] = {}
         result = list(slot_paths)
         for index, slot_path in enumerate(slot_paths):
             tail_len = int(slot_path.numel()) % self.page_size
-            if tail_len:
-                partial.append((index, slot_path, tail_len))
-        if not partial:
+            if not tail_len:
+                continue
+            source_tail = slot_path[-tail_len:]
+            source_page_ids = torch.div(
+                source_tail,
+                self.page_size,
+                rounding_mode="floor",
+            )
+            if int(torch.unique(source_page_ids).numel()) != 1:
+                raise RuntimeError("route partial tail spans multiple physical pages")
+            tail_page_id = int(source_page_ids[0].item())
+            partial_groups.setdefault(tail_page_id, []).append(
+                (index, slot_path, tail_len)
+            )
+
+        copy_plan = [entry for group in partial_groups.values() for entry in group[1:]]
+        if not copy_plan:
             return result
 
-        destination_pages = self._allocate_full_pages(len(partial))
-        for destination_page, (index, slot_path, tail_len) in zip(destination_pages, partial):
+        destination_pages = self._allocate_full_pages(len(copy_plan))
+        for destination_page, (index, slot_path, tail_len) in zip(
+            destination_pages,
+            copy_plan,
+        ):
             source_tail = slot_path[-tail_len:]
             destination_tail = destination_page[:tail_len]
             self._copy_kv_slots(destination_tail, source_tail)
