@@ -537,12 +537,17 @@ target_tokens_per_second  = generated_tokens / target_elapsed_s
 overall_tokens_per_second = generated_tokens / total_elapsed_s
 ```
 
-`drafter_elapsed_s` includes each round's Drafter prefix rebuild, route
-initialization, and complete tree build. `target_elapsed_s` is the accumulated
-verify RPC interval, including optional Target fallback AR and RPC latency.
-`total_elapsed_s` spans the serial generation loop and exposes controller
-overhead in addition to both phases. Target prompt prefill is reported as
-`target_prefill_elapsed_s` and deliberately excluded from all three rates.
+`drafter_elapsed_s` includes each round's route initialization, complete tree
+build, and selected-route commit or fallback-token handoff. The Drafter prompt
+is prefilled once and its KV is reused across rounds; prompt prefill is reported
+separately and excluded from this phase. For GSM8K `--backend atlas_serial`,
+`target_elapsed_s` measures the in-process verify call, including optional
+Target fallback AR, with no HTTP/RPC transport. MT-Bench
+`--execution-mode serial` still uses `RemoteTargetClient`, so its corresponding
+Target interval does include RPC latency. `total_elapsed_s` spans the serial
+generation loop and exposes controller overhead in addition to both phases.
+Target prompt prefill is reported as `target_prefill_elapsed_s` and deliberately
+excluded from all three rates.
 GSM8K `summary.json` and MT-Bench candidate summaries contain a weighted
 `serial_speed` aggregate computed as total generated tokens divided by summed
 phase time, rather than an unweighted mean of per-turn rates.

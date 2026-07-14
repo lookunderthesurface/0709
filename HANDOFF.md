@@ -135,10 +135,13 @@ Never tune on the GSM8K test subset and then present the same subset as final
 evidence; create a development split, freeze policy, and use the full test set
 for the final comparison.
 
-Serial core profiling attributed approximately 59.63% of time to the Drafter
-and 40.32% to the Target, with negligible controller residual under the current
-accounting. This supports studying overlap but does not replace isolated or
-real-platform measurements.
+The historical alpha=0.25, no-fallback serial profile attributed 59.63% of the
+core time to the Drafter and 40.32% to the Target. A 2026-07-14 recheck at
+`d4d54ec` did not show an end-to-end gain: on the 84 examples whose old and new
+responses and work counts match exactly, Drafter time increased 3.20%, Target
+time was effectively unchanged (+0.28%), and serial core time increased 2.02%.
+See the detailed comparison and accounting limits in Section 5. This still
+supports studying overlap, but it does not establish a serial-system speedup.
 
 The 0713 route-matrix branch correctly implements shared-prefix/private-suffix
 attention with LSE merge, but it did not beat the fair ordinary shared-page-
@@ -830,6 +833,84 @@ bash scripts/run_gsm8k_atlas_serial.sh \
 
 The direct Python equivalent is `python scripts/gsm8k_eval.py --backend
 atlas_serial`; the normal async backend is `--backend atlas`.
+
+### 2026-07-14 Drafter/Target speed recheck
+
+This recheck used the same H800 and the historical serial accounting, with
+GSM8K examples 0--99, `llama-8shot`, strict-marker extraction, FP16, `k=3`,
+`d=4`, max-new-tokens 512, context/prefill 4096, page size 16, static memory
+fraction 0.75, max-running-requests 32, max-total-tokens 32768, one warmup, and
+a 128 MiB Target workspace. Current code was clean at `d4d54ec`.
+
+The primary metric is milliseconds per serial round. Component tok/s uses the
+same committed output-token count as numerator for both models; it is useful
+for system accounting but is not either model's actual input-token throughput.
+`+` in the change column means slower.
+
+The clearest pure verify comparison is alpha=0.25 with both fallback triggers
+disabled. Old and current full runs differ by 9 output tokens and 2 rounds, so
+the table uses the 84 examples with byte-identical responses and exactly
+matching work: 8,467 output tokens and 2,148 rounds in every run.
+
+| Phase | Old single run (ms/round) | Current mean +/- sample SD, n=3 | Change |
+|---|---:|---:|---:|
+| Drafter tree + handoff | 28.310811 | 29.218059 +/- 0.352267 | +3.2046% |
+| Target masked verify | 19.142821 | 19.196739 +/- 0.170154 | +0.2817% |
+| Serial core total | 47.474217 | 48.434887 +/- 0.501142 | +2.0236% |
+
+The corresponding committed-output rates were 139.233252 -> 134.922918
+tok/s for Drafter, 205.915642 -> 205.348061 tok/s for Target, and 83.030466
+-> 81.389397 tok/s overall. On all 100 examples, end-to-end rate including
+prompt prefills was 77.894548 tok/s old versus 76.487470 +/- 0.732169 tok/s
+current.
+
+The operational default uses weights `0.45,0.30,0.17,0.08`, fallback threshold
+-0.5, first-token threshold -0.7, and four fallback AR tokens. Its full
+trajectory changed from 11,353 tokens / 2,877 rounds / 441 fallbacks to 11,627
+/ 2,945 / 440; one current response reached the 512-token cap. The table
+therefore uses the stricter 85-example intersection with byte-identical
+responses and identical work: 9,562 tokens, 2,423 rounds, 362 fallbacks, and
+1,448 fallback-appended tokens in every run.
+
+| Phase | Old single run (ms/round) | Current mean +/- sample SD, n=2 | Change |
+|---|---:|---:|---:|
+| Drafter tree + handoff | 29.476867 | 30.255666 +/- 0.026156 | +2.6421% |
+| Target verify + fallback | 28.981839 | 28.999736 +/- 0.015939 | +0.0618% |
+| Serial core total | 58.478294 | 59.274950 +/- 0.042245 | +1.3623% |
+
+The corresponding committed-output rates were 133.879478 -> 130.433386
+tok/s for Drafter, 136.166222 -> 136.082207 tok/s for Target, and 67.483971
+-> 66.577003 tok/s overall. The all-100 end-to-end rate was 64.026452 tok/s
+old versus 63.569604 +/- 0.052380 tok/s current, but that aggregate includes
+the changed generation trajectory and is not a model-only speed comparison.
+
+Current repeats reproduced their observable trajectories exactly. The old
+artifacts, however, contain predictions and summaries but no exact Git hash or
+complete command manifest. Their serialized settings and reconstructed launcher
+defaults match this recheck, so use them as historical references rather than a
+same-binary controlled A/B. The old run is also a single observation; the
+current sample deviations above describe repeatability and are not a
+significance test.
+
+The phase timers intentionally preserve the historical boundary. In-process
+Target scoring synchronizes the main verify through a CPU copy, but there is no
+explicit CUDA synchronization immediately after `target_client.verify()`.
+Target KV-commit tail work, and the final fallback forward when applicable, can
+therefore leak into the following Drafter handoff synchronization. Treat the
+Drafter/Target split as a regression diagnostic. Serial total and end-to-end
+time are the more robust system measurements; add a separately named,
+explicitly synchronized timer before making publication-grade phase-attribution
+claims, and do not mix that future timer with these historical numbers.
+
+Artifacts:
+
+```text
+old no-fallback:  /home/hwc/workspace/0701/0709_outputs/gsm8k_serial_path_weight_sweep/alpha_0p25
+old default:      /home/hwc/workspace/0701/0709_outputs/gsm8k_serial_wrapper_reuse
+current root:     /home/hwc/workspace/0701/0709_outputs/serial_speed_d4d54ec
+no-fallback runs: alpha0p25_nofallback_run1 .. run3
+default runs:     current_default_run1 .. run2
+```
 
 ## 6. MT-Bench Quality Evaluation
 
