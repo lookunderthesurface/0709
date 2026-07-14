@@ -96,11 +96,17 @@ class SGLangRoutePoolBridge:
     max_context_len: int | None = None
     device: str | torch.device = "cuda"
     prefix_slot_ids: torch.Tensor | None = None
+    prefix_slot_count: int = 0
     prefix_page_ids: set[int] = field(default_factory=set)
     route_rows: dict[int, SGLangRouteRow] = field(default_factory=dict)
-    node_slot_ids: dict[int, int] = field(default_factory=dict)
+    node_slot_ids: dict[int, int | torch.Tensor] = field(default_factory=dict)
     route_slot_paths: dict[int, torch.Tensor] = field(default_factory=dict)
+    route_tail_page_keys: dict[int, int] = field(default_factory=dict)
+    prefix_tail_page_key: int | None = None
+    prefix_partial_tail_keys: dict[int, int] = field(default_factory=dict)
+    next_tail_page_key: int = 1
     owned_page_ids: set[int] = field(default_factory=set)
+    pending_owned_slot_tensors: list[torch.Tensor] = field(default_factory=list)
     cow_pages_copied: int = 0
     cow_tokens_copied: int = 0
     attention_metadata_builds: int = 0
@@ -116,6 +122,8 @@ class SGLangRoutePoolBridge:
     req_row_append_elements: int = 0
     req_row_cow_patch_calls: int = 0
     req_row_cow_patch_elements: int = 0
+    hot_path_host_transfer_batches: int = 0
+    hot_path_host_transfer_elements: int = 0
     use_page_attention_metadata: bool = True
     validate_page_layout: bool = True
 
@@ -164,11 +172,69 @@ class SGLangRoutePoolBridge:
 
     def set_prefix_slots(self, slot_ids: Sequence[int] | torch.Tensor) -> None:
         self.prefix_slot_ids = _as_1d_long_tensor(slot_ids, device=self.device)
-        self.prefix_page_ids = {
-            int(slot_id) // self.page_size
-            for slot_id in _int_list(self.prefix_slot_ids)
-        }
+        self._refresh_prefix_cpu_metadata()
         self.owned_page_ids = set(self.prefix_page_ids)
+        self.pending_owned_slot_tensors.clear()
+        self.prefix_partial_tail_keys.clear()
+        self.prefix_tail_page_key = (
+            self._new_tail_page_key()
+            if self.prefix_slot_count
+            and self.prefix_slot_count % self.page_size
+            else None
+        )
+        if self.prefix_tail_page_key is not None:
+            tail_page_index = (self.prefix_slot_count - 1) // self.page_size
+            self.prefix_partial_tail_keys[tail_page_index] = self.prefix_tail_page_key
+
+    def _refresh_prefix_cpu_metadata(self) -> None:
+        if self.prefix_slot_ids is None or int(self.prefix_slot_ids.numel()) == 0:
+            self.prefix_slot_count = 0
+            self.prefix_page_ids.clear()
+            return
+        self.prefix_slot_count = int(self.prefix_slot_ids.numel())
+        page_ids = torch.div(
+            self.prefix_slot_ids[:: self.page_size],
+            self.page_size,
+            rounding_mode="floor",
+        ).to(dtype=torch.long)
+        self.prefix_page_ids = {
+            int(page_id)
+            for page_id in _int_list(page_ids)
+        }
+
+    def _new_tail_page_key(self) -> int:
+        # Negative lease ids cannot collide with fallback physical page ids,
+        # which are non-negative.
+        key = -int(self.next_tail_page_key)
+        self.next_tail_page_key += 1
+        return key
+
+    def _record_pending_owned_slots(self, slot_ids: torch.Tensor) -> None:
+        if int(slot_ids.numel()) > 0:
+            self.pending_owned_slot_tensors.append(slot_ids.detach().reshape(-1))
+
+    def _materialize_pending_owned_pages(self) -> None:
+        """Update CPU ownership only at pruning/report boundaries.
+
+        Decode keeps newly allocated slot ids on device.  Their page ids are
+        not needed for attention or request-row writes, so transferring them
+        in every frontier would add a second D2H fence beside candidate
+        materialization.  Pruning and diagnostics flush all pending slots in
+        one batch instead.
+        """
+
+        if not self.pending_owned_slot_tensors:
+            return
+        slots = torch.cat(self.pending_owned_slot_tensors, dim=0)
+        self.owned_page_ids.update(
+            int(slot_id) // self.page_size
+            for slot_id in _int_list(slots)
+        )
+        self.pending_owned_slot_tensors.clear()
+
+    def owned_page_count(self) -> int:
+        self._materialize_pending_owned_pages()
+        return len(self.owned_page_ids)
 
     def bind_existing_route_row(
         self,
@@ -228,15 +294,26 @@ class SGLangRoutePoolBridge:
             for route_id, slot_path in self.route_slot_paths.items()
             if route_id in retained
         }
+        self.route_tail_page_keys = {
+            route_id: tail_key
+            for route_id, tail_key in self.route_tail_page_keys.items()
+            if route_id in retained
+        }
         return len(released)
 
     def register_node_slots(self, node_ids: Sequence[int] | torch.Tensor, slot_ids: Sequence[int] | torch.Tensor) -> None:
         node_list = _int_list(node_ids)
-        slot_list = _int_list(slot_ids)
-        if len(node_list) != len(slot_list):
+        if isinstance(slot_ids, torch.Tensor):
+            slot_values: list[int | torch.Tensor] = [
+                slot_ids.reshape(-1)[index]
+                for index in range(int(slot_ids.numel()))
+            ]
+        else:
+            slot_values = [int(slot_id) for slot_id in slot_ids]
+        if len(node_list) != len(slot_values):
             raise ValueError("node_ids and slot_ids must have the same length")
-        for node_id, slot_id in zip(node_list, slot_list):
-            self.node_slot_ids[int(node_id)] = int(slot_id)
+        for node_id, slot_id in zip(node_list, slot_values):
+            self.node_slot_ids[int(node_id)] = slot_id
 
     def reconcile_route_rows(
         self,
@@ -257,6 +334,9 @@ class SGLangRoutePoolBridge:
             if parent_slot_path is not None:
                 for child in children:
                     self.route_slot_paths[int(child.route_id)] = parent_slot_path
+                    parent_tail_key = self.route_tail_page_keys.get(parent_id)
+                    if parent_tail_key is not None:
+                        self.route_tail_page_keys[int(child.route_id)] = parent_tail_key
             if row is None:
                 continue
 
@@ -284,11 +364,17 @@ class SGLangRoutePoolBridge:
                 "cannot promote route KV to prefix: "
                 f"slot_path_len={int(full_slot_path.numel())}, expected={expected_len}"
             )
-        self.prefix_page_ids = {
-            int(slot_id) // self.page_size
-            for slot_id in _int_list(full_slot_path)
-        }
         self.prefix_slot_ids = full_slot_path
+        self._refresh_prefix_cpu_metadata()
+        self.prefix_partial_tail_keys.clear()
+        self.prefix_tail_page_key = (
+            self.route_tail_page_keys.get(int(route.route_id))
+            if int(full_slot_path.numel()) % self.page_size
+            else None
+        )
+        if self.prefix_tail_page_key is not None:
+            tail_page_index = (int(full_slot_path.numel()) - 1) // self.page_size
+            self.prefix_partial_tail_keys[tail_page_index] = self.prefix_tail_page_key
         return full_slot_path
 
     def page_reference_counts(self) -> dict[int, int]:
@@ -303,21 +389,39 @@ class SGLangRoutePoolBridge:
         """
 
         counts: dict[int, int] = {}
-
-        def add_path(slot_path: torch.Tensor | None) -> None:
-            if slot_path is None or int(slot_path.numel()) == 0:
-                return
-            page_ids = {
-                int(slot_id) // self.page_size
-                for slot_id in _int_list(slot_path)
-            }
+        paths = [self.prefix_slot_ids, *self.route_slot_paths.values()]
+        for page_ids in self._page_id_sets_for_paths(paths):
             for page_id in page_ids:
                 counts[page_id] = counts.get(page_id, 0) + 1
-
-        add_path(self.prefix_slot_ids)
-        for slot_path in self.route_slot_paths.values():
-            add_path(slot_path)
         return dict(sorted(counts.items()))
+
+    def _page_id_sets_for_paths(
+        self,
+        paths: Sequence[torch.Tensor | None],
+    ) -> list[set[int]]:
+        page_counts: list[int] = []
+        page_parts: list[torch.Tensor] = []
+        for path in paths:
+            if path is None or int(path.numel()) == 0:
+                page_counts.append(0)
+                continue
+            sampled_slots = torch.cat((path[:: self.page_size], path[-1:]))
+            page_ids = torch.div(
+                sampled_slots,
+                self.page_size,
+                rounding_mode="floor",
+            ).to(dtype=torch.long)
+            page_counts.append(int(page_ids.numel()))
+            page_parts.append(page_ids)
+        flat_page_ids = _int_list(torch.cat(page_parts)) if page_parts else []
+        result: list[set[int]] = []
+        offset = 0
+        for count in page_counts:
+            result.append(
+                {int(page_id) for page_id in flat_page_ids[offset : offset + count]}
+            )
+            offset += count
+        return result
 
     def release_unreferenced_node_slots(self, live_node_ids: Sequence[int]) -> int:
         """Release pages that contain no committed-prefix or live-route slots.
@@ -327,13 +431,13 @@ class SGLangRoutePoolBridge:
         reachable. Dead node mappings on a partially live page are forgotten
         but the physical page stays allocated.
         """
+        self._materialize_pending_owned_pages()
         live_nodes = {int(node_id) for node_id in live_node_ids}
         live_pages = set(self.prefix_page_ids)
-        for slot_path in self.route_slot_paths.values():
-            live_pages.update(
-                int(slot_id) // self.page_size
-                for slot_id in _int_list(slot_path)
-            )
+        for page_ids in self._page_id_sets_for_paths(
+            list(self.route_slot_paths.values())
+        ):
+            live_pages.update(page_ids)
         releasable_pages = sorted(self.owned_page_ids - live_pages)
 
         for node_id in list(self.node_slot_ids):
@@ -355,11 +459,17 @@ class SGLangRoutePoolBridge:
 
     def clear_physical_state(self) -> None:
         self.prefix_slot_ids = None
+        self.prefix_slot_count = 0
         self.prefix_page_ids.clear()
+        self.prefix_tail_page_key = None
+        self.prefix_partial_tail_keys.clear()
         self.route_rows.clear()
         self.node_slot_ids.clear()
         self.route_slot_paths.clear()
+        self.route_tail_page_keys.clear()
+        self.next_tail_page_key = 1
         self.owned_page_ids.clear()
+        self.pending_owned_slot_tensors.clear()
         self.cow_pages_copied = 0
         self.cow_tokens_copied = 0
         self.attention_metadata_builds = 0
@@ -375,6 +485,8 @@ class SGLangRoutePoolBridge:
         self.req_row_append_elements = 0
         self.req_row_cow_patch_calls = 0
         self.req_row_cow_patch_elements = 0
+        self.hot_path_host_transfer_batches = 0
+        self.hot_path_host_transfer_elements = 0
         clear_req_pool = getattr(self.req_to_token_pool, "clear", None)
         if callable(clear_req_pool):
             clear_req_pool()
@@ -404,10 +516,12 @@ class SGLangRoutePoolBridge:
         *,
         prefix_lens: Sequence[int],
         seq_lens: Sequence[int],
-        last_locs: Sequence[int],
+        last_locs: Sequence[int] | torch.Tensor,
     ) -> torch.Tensor:
-        prefix_lens_tensor = _as_1d_long_tensor(prefix_lens, device=self.device)
-        seq_lens_tensor = _as_1d_long_tensor(seq_lens, device=self.device)
+        prefix_lens_cpu = torch.tensor(list(prefix_lens), dtype=torch.long)
+        seq_lens_cpu = torch.tensor(list(seq_lens), dtype=torch.long)
+        prefix_lens_tensor = prefix_lens_cpu.to(device=self.device)
+        seq_lens_tensor = seq_lens_cpu.to(device=self.device)
         last_locs_tensor = _as_1d_long_tensor(last_locs, device=self.device)
         if not (
             prefix_lens_tensor.numel()
@@ -415,7 +529,10 @@ class SGLangRoutePoolBridge:
             == last_locs_tensor.numel()
         ):
             raise ValueError("prefix_lens, seq_lens, and last_locs must have the same length")
-        extend_num_tokens = int((seq_lens_tensor - prefix_lens_tensor).sum().item())
+        extend_num_tokens = sum(
+            int(seq_len) - int(prefix_len)
+            for prefix_len, seq_len in zip(prefix_lens, seq_lens)
+        )
         if extend_num_tokens <= 0:
             raise ValueError("extend_num_tokens must be positive")
 
@@ -423,9 +540,9 @@ class SGLangRoutePoolBridge:
         if callable(alloc_extend):
             result = alloc_extend(
                 prefix_lens_tensor,
-                prefix_lens_tensor.detach().cpu(),
+                prefix_lens_cpu,
                 seq_lens_tensor,
-                seq_lens_tensor.detach().cpu(),
+                seq_lens_cpu,
                 last_locs_tensor,
                 extend_num_tokens,
             )
@@ -439,9 +556,10 @@ class SGLangRoutePoolBridge:
         self,
         *,
         seq_lens: Sequence[int],
-        last_locs: Sequence[int],
+        last_locs: Sequence[int] | torch.Tensor,
     ) -> torch.Tensor:
-        seq_lens_tensor = _as_1d_long_tensor(seq_lens, device=self.device)
+        seq_lens_cpu = torch.tensor(list(seq_lens), dtype=torch.long)
+        seq_lens_tensor = seq_lens_cpu.to(device=self.device)
         last_locs_tensor = _as_1d_long_tensor(last_locs, device=self.device)
         if seq_lens_tensor.numel() != last_locs_tensor.numel():
             raise ValueError("seq_lens and last_locs must have the same length")
@@ -450,7 +568,7 @@ class SGLangRoutePoolBridge:
         if callable(alloc_decode):
             result = alloc_decode(
                 seq_lens_tensor,
-                seq_lens_tensor.detach().cpu(),
+                seq_lens_cpu,
                 last_locs_tensor,
             )
             if result is not None:
@@ -476,11 +594,12 @@ class SGLangRoutePoolBridge:
                 f"expected={expected}, got={int(slots.numel())}"
             )
         pages = slots.reshape(int(count), self.page_size)
-        for page_slots in pages:
-            page_ids = torch.div(page_slots, self.page_size, rounding_mode="floor")
-            if int(torch.unique(page_ids).numel()) != 1:
-                raise RuntimeError("SGLang allocator returned a non-contiguous COW page")
-            self.owned_page_ids.add(int(page_ids[0].item()))
+        page_ids = torch.div(pages, self.page_size, rounding_mode="floor")
+        _assert_device_true(
+            page_ids.eq(page_ids[:, :1]).all(),
+            "SGLang allocator returned a non-contiguous COW page",
+        )
+        self._record_pending_owned_slots(pages[:, 0])
         return pages
 
     def _copy_kv_slots(self, destination: torch.Tensor, source: torch.Tensor) -> None:
@@ -529,23 +648,50 @@ class SGLangRoutePoolBridge:
         # Grouping solely by page also handles aliased views with different
         # valid tail lengths; each copied view preserves its own valid length.
         partial_groups: dict[int, list[tuple[int, torch.Tensor, int]]] = {}
+        missing_tail_keys: list[
+            tuple[int, torch.Tensor, int, int, torch.Tensor]
+        ] = []
         result = list(slot_paths)
         for index, slot_path in enumerate(slot_paths):
             tail_len = int(slot_path.numel()) % self.page_size
             if not tail_len:
                 continue
-            source_tail = slot_path[-tail_len:]
-            source_page_ids = torch.div(
-                source_tail,
-                self.page_size,
-                rounding_mode="floor",
-            )
-            if int(torch.unique(source_page_ids).numel()) != 1:
-                raise RuntimeError("route partial tail spans multiple physical pages")
-            tail_page_id = int(source_page_ids[0].item())
-            partial_groups.setdefault(tail_page_id, []).append(
+            route_id = int(routes[index].route_id)
+            tail_page_key = self.route_tail_page_keys.get(route_id)
+            if tail_page_key is None:
+                # Compatibility path for externally injected/test slot paths.
+                # Production paths carry a CPU lease key through every fork,
+                # so this batched fallback is not part of the decode hot path.
+                source_tail = slot_path[-tail_len:]
+                source_page_ids = torch.div(
+                    source_tail,
+                    self.page_size,
+                    rounding_mode="floor",
+                )
+                _assert_device_true(
+                    source_page_ids.eq(source_page_ids[:1]).all(),
+                    "route partial tail spans multiple physical pages",
+                )
+                missing_tail_keys.append(
+                    (index, slot_path, tail_len, route_id, source_page_ids[:1])
+                )
+                continue
+            partial_groups.setdefault(tail_page_key, []).append(
                 (index, slot_path, tail_len)
             )
+
+        if missing_tail_keys:
+            fallback_page_keys = _int_list(
+                torch.cat([entry[4] for entry in missing_tail_keys], dim=0)
+            )
+            self.hot_path_host_transfer_batches += 1
+            self.hot_path_host_transfer_elements += len(fallback_page_keys)
+            for entry, tail_page_key in zip(missing_tail_keys, fallback_page_keys):
+                index, slot_path, tail_len, route_id, _ = entry
+                self.route_tail_page_keys[route_id] = int(tail_page_key)
+                partial_groups.setdefault(int(tail_page_key), []).append(
+                    (index, slot_path, tail_len)
+                )
 
         copy_plan = [entry for group in partial_groups.values() for entry in group[1:]]
         if not copy_plan:
@@ -563,6 +709,7 @@ class SGLangRoutePoolBridge:
             copied_path = torch.cat((slot_path[:-tail_len], destination_tail), dim=0)
             route_id = int(routes[index].route_id)
             self.route_slot_paths[route_id] = copied_path
+            self.route_tail_page_keys[route_id] = self._new_tail_page_key()
             result[index] = copied_path
             dirty_starts[index] = int(slot_path.numel()) - int(tail_len)
             self.cow_pages_copied += 1
@@ -596,47 +743,56 @@ class SGLangRoutePoolBridge:
                     if row.pending_dirty_start is None
                     else min(int(row.pending_dirty_start), int(dirty_start))
                 )
-        seq_lens: list[int] = []
-        last_locs: list[int] = []
-        for slot_path in slot_paths:
-            previous_len = int(slot_path.numel())
-            seq_lens.append(previous_len + 1)
-            last_locs.append(int(slot_path[-1].item()) if previous_len else -1)
+        seq_lens = [int(slot_path.numel()) + 1 for slot_path in slot_paths]
+        last_locs_tensor = torch.cat(
+            [
+                slot_path[-1:].to(dtype=torch.long)
+                if int(slot_path.numel())
+                else torch.full(
+                    (1,),
+                    -1,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                for slot_path in slot_paths
+            ],
+            dim=0,
+        )
 
         if output_slot_ids is None:
             output_slot_ids = self.allocate_decode_slots(
                 seq_lens=seq_lens,
-                last_locs=last_locs,
+                last_locs=last_locs_tensor,
             )
         else:
             output_slot_ids = _as_1d_long_tensor(output_slot_ids, device=self.device)
         if int(output_slot_ids.numel()) != len(active_routes):
             raise ValueError("output_slot_ids must have one slot per active route")
-        if int(torch.unique(output_slot_ids).numel()) != len(active_routes):
-            raise RuntimeError(
+        if len(active_routes) > 1:
+            duplicates = output_slot_ids[:, None].eq(output_slot_ids[None, :])
+            duplicates.fill_diagonal_(False)
+            _assert_device_true(
+                duplicates.logical_not().all(),
                 "SGLang allocated duplicate output KV slots across forked routes; "
-                "tail-page copy-on-write is not active"
+                "tail-page copy-on-write is not active",
             )
-        self.owned_page_ids.update(
-            int(slot_id) // self.page_size
-            for slot_id in _int_list(output_slot_ids)
-        )
+        self._record_pending_owned_slots(output_slot_ids)
 
         positions: list[int] = []
         full_slot_paths: list[torch.Tensor] = []
 
-        req_pool_index_list = _int_list(req_pool_indices)
-        output_slot_list = _int_list(output_slot_ids)
-        for route, slot_path, req_pool_index, output_slot in zip(
-            active_routes,
-            slot_paths,
-            req_pool_index_list,
-            output_slot_list,
+        req_pool_index_list = [
+            self.route_rows[int(route.route_id)].req_pool_index
+            for route in active_routes
+        ]
+        for route_index, (route, slot_path, req_pool_index) in enumerate(
+            zip(active_routes, slot_paths, req_pool_index_list)
         ):
+            output_slot = output_slot_ids[route_index : route_index + 1]
             full_slot_path = torch.cat(
                 [
                     slot_path,
-                    torch.tensor([int(output_slot)], device=self.device, dtype=torch.long),
+                    output_slot,
                 ],
                 dim=0,
             )
@@ -672,11 +828,19 @@ class SGLangRoutePoolBridge:
             row.written_length = int(full_slot_path.numel())
             row.pending_dirty_start = None
             self.route_slot_paths[int(route.route_id)] = full_slot_path
+            if (
+                previous_len % self.page_size == 0
+                or int(route.route_id) not in self.route_tail_page_keys
+            ):
+                self.route_tail_page_keys[int(route.route_id)] = (
+                    self._new_tail_page_key()
+                )
             seq_len = int(full_slot_path.numel())
             positions.append(seq_len - 1)
             full_slot_paths.append(full_slot_path)
 
-        seq_lens_tensor = torch.tensor(seq_lens, device=self.device, dtype=torch.long)
+        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.long)
+        seq_lens_tensor = seq_lens_cpu.to(device=self.device)
         token_index_count = int(sum(seq_lens))
         paged_decode_spec = None
         attention_page_size = 1
@@ -704,6 +868,8 @@ class SGLangRoutePoolBridge:
             out_cache_loc=output_slot_ids,
             positions=torch.tensor(positions, device=self.device, dtype=torch.long),
             orig_seq_lens=seq_lens_tensor,
+            seq_lens_sum=int(sum(seq_lens)),
+            seq_lens_cpu=seq_lens_cpu,
             attention_page_size=attention_page_size,
             token_index_count=token_index_count,
             page_index_count=page_index_count,
@@ -727,7 +893,8 @@ class SGLangRoutePoolBridge:
                 )
             return existing
         if route.parent_route_id is not None:
-            parent_path = self.route_slot_paths.get(int(route.parent_route_id))
+            parent_id = int(route.parent_route_id)
+            parent_path = self.route_slot_paths.get(parent_id)
             if parent_path is not None:
                 if int(parent_path.numel()) != expected_length:
                     raise RuntimeError(
@@ -736,6 +903,9 @@ class SGLangRoutePoolBridge:
                         f"logical={expected_length}"
                     )
                 self.route_slot_paths[route_id] = parent_path
+                parent_tail_key = self.route_tail_page_keys.get(parent_id)
+                if parent_tail_key is not None:
+                    self.route_tail_page_keys[route_id] = parent_tail_key
                 return parent_path
 
         committed_length = int(route.kv_view.prefix.committed_length)
@@ -758,6 +928,15 @@ class SGLangRoutePoolBridge:
             )
         slot_path = prefix
         self.route_slot_paths[route_id] = slot_path
+        if committed_length % self.page_size:
+            tail_page_index = (committed_length - 1) // self.page_size
+            tail_key = self.prefix_partial_tail_keys.get(tail_page_index)
+            if tail_key is None:
+                tail_key = self._new_tail_page_key()
+                self.prefix_partial_tail_keys[tail_page_index] = tail_key
+            if committed_length == self.prefix_slot_count:
+                self.prefix_tail_page_key = tail_key
+            self.route_tail_page_keys[route_id] = tail_key
         return slot_path
 
     def _write_req_token_row(self, req_pool_index: int, slot_path: torch.Tensor) -> None:
@@ -848,6 +1027,12 @@ class SGLangRoutePoolBridge:
             "req_row_append_elements": int(self.req_row_append_elements),
             "req_row_cow_patch_calls": int(self.req_row_cow_patch_calls),
             "req_row_cow_patch_elements": int(self.req_row_cow_patch_elements),
+            "hot_path_host_transfer_batches": int(
+                self.hot_path_host_transfer_batches
+            ),
+            "hot_path_host_transfer_elements": int(
+                self.hot_path_host_transfer_elements
+            ),
         }
 
 
@@ -929,17 +1114,22 @@ class SGLangFlashInferFrontierModelBackend:
         req_pool_index = int(_int_list(indices)[0])
         handle.req_pool_idx = req_pool_index
         try:
-            last_loc = int(prefix_slots[-1].detach().cpu().item()) if prefix_len else -1
+            last_loc = (
+                prefix_slots[-1:].to(dtype=torch.long)
+                if prefix_len
+                else torch.full((1,), -1, device=device, dtype=torch.long)
+            )
             suffix_slots = self.route_pool.allocate_extend_slots(
                 prefix_lens=[prefix_len],
                 seq_lens=[seq_len],
-                last_locs=[last_loc],
+                last_locs=last_loc,
             )
             full_slots = torch.cat([prefix_slots, suffix_slots], dim=0)
             self.route_pool._write_req_token_row(req_pool_index, full_slots)
 
             req_pool_indices = torch.tensor([req_pool_index], device=device, dtype=torch.long)
-            seq_lens = torch.tensor([seq_len], device=device, dtype=torch.long)
+            seq_lens_cpu = torch.tensor([seq_len], dtype=torch.long)
+            seq_lens = seq_lens_cpu.to(device=device)
             extend_seq_lens = torch.tensor([suffix_len], device=device, dtype=torch.long)
             extend_prefix_lens = torch.tensor([prefix_len], device=device, dtype=torch.long)
             forward_batch = ForwardBatch(
@@ -952,7 +1142,7 @@ class SGLangFlashInferFrontierModelBackend:
                 seq_lens_sum=seq_len,
                 orig_seq_lens=seq_lens,
                 positions=torch.arange(prefix_len, seq_len, device=device, dtype=torch.long),
-                seq_lens_cpu=seq_lens.detach().cpu(),
+                seq_lens_cpu=seq_lens_cpu,
                 capture_hidden_mode=_capture_hidden_mode_null(),
                 is_extend_in_batch=True,
                 all_extend_in_batch=True,
@@ -1205,21 +1395,24 @@ def prefill_sglang_prefix(
         if chunk_len <= 0:
             continue
 
-        last_loc = -1
-        if prefix_slot_parts:
-            last_loc = int(prefix_slot_parts[-1][-1].detach().cpu().item())
+        last_loc = (
+            prefix_slot_parts[-1][-1:].to(dtype=torch.long)
+            if prefix_slot_parts
+            else torch.full((1,), -1, device=device, dtype=torch.long)
+        )
 
         chunk_slot_ids = route_pool.allocate_extend_slots(
             prefix_lens=[chunk_start],
             seq_lens=[chunk_end],
-            last_locs=[last_loc],
+            last_locs=last_loc,
         )
         prefix_slot_parts.append(chunk_slot_ids)
         prefix_slot_ids = torch.cat(prefix_slot_parts, dim=0)
         route_pool._write_req_token_row(req_pool_index, prefix_slot_ids)
         _sync_cuda_if_needed()
 
-        seq_lens = torch.tensor([chunk_end], device=device, dtype=torch.long)
+        seq_lens_cpu = torch.tensor([chunk_end], dtype=torch.long)
+        seq_lens = seq_lens_cpu.to(device=device)
         extend_seq_lens = torch.tensor([chunk_len], device=device, dtype=torch.long)
         extend_prefix_lens = torch.tensor([chunk_start], device=device, dtype=torch.long)
         positions = torch.arange(chunk_start, chunk_end, device=device, dtype=torch.long)
@@ -1234,7 +1427,7 @@ def prefill_sglang_prefix(
             seq_lens_sum=chunk_end,
             orig_seq_lens=seq_lens,
             positions=positions,
-            seq_lens_cpu=seq_lens.detach().cpu(),
+            seq_lens_cpu=seq_lens_cpu,
             capture_hidden_mode=_capture_hidden_mode_null(),
             is_extend_in_batch=True,
             all_extend_in_batch=True,
@@ -1775,6 +1968,25 @@ def _as_1d_long_tensor(value: Sequence[int] | torch.Tensor, *, device: str | tor
     if tensor.ndim != 1:
         raise ValueError(f"expected a 1D tensor, got shape {tuple(tensor.shape)}")
     return tensor
+
+
+def _assert_device_true(condition: torch.Tensor, message: str) -> None:
+    """Validate a scalar tensor without synchronizing the CUDA hot path."""
+
+    if condition.numel() != 1:
+        raise ValueError("device assertion condition must be scalar")
+    if condition.device.type == "cpu":
+        if not bool(condition.item()):
+            raise RuntimeError(message)
+        return
+    assert_async = getattr(torch, "_assert_async", None)
+    if callable(assert_async):
+        assert_async(condition, message)
+        return
+    raise RuntimeError(
+        "CUDA validation requires torch._assert_async to avoid a "
+        "device-to-host synchronization"
+    )
 
 
 def _int_list(value: Sequence[int] | torch.Tensor) -> list[int]:

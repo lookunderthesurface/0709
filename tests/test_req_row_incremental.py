@@ -148,12 +148,16 @@ def test_new_row_full_init_then_inherited_row_appends_one_slot() -> None:
     bridge.route_slot_paths[1] = torch.tensor([0, 1, 2, 3], dtype=torch.long)
     bridge.bind_existing_route_row(1, 0)
 
-    bridge.prepare_frontier(
+    _, metadata = bridge.prepare_frontier(
         [parent],
         output_slot_ids=torch.tensor([4], dtype=torch.long),
     )
 
     assert bridge.req_to_token_pool.req_to_token[0, :5].tolist() == [0, 1, 2, 3, 4]
+    assert metadata.seq_lens_sum == 5
+    assert metadata.seq_lens_cpu is not None
+    assert metadata.seq_lens_cpu.device.type == "cpu"
+    assert metadata.seq_lens_cpu.tolist() == [5]
     assert bridge.route_rows[1].written_length == 5
     assert bridge.req_to_token_pool.write_log == [(0, 0, 5, [0, 1, 2, 3, 4])]
 

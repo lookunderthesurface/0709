@@ -72,6 +72,8 @@ def test_shared_partial_tail_copies_only_one_writer() -> None:
     assert copied[1].tolist() == [40, 41, 42]
     assert bridge.cow_pages_copied == 1
     assert bridge.cow_tokens_copied == 3
+    assert bridge.hot_path_counters()["hot_path_host_transfer_batches"] == 1
+    assert bridge.hot_path_counters()["hot_path_host_transfer_elements"] == 2
     assert bridge.token_to_kv_pool_allocator.kv_cache.moves == [
         ([40, 41, 42], [0, 1, 2]),
     ]
@@ -109,6 +111,50 @@ def test_same_partial_page_with_different_valid_lengths_is_copied() -> None:
     assert bridge.token_to_kv_pool_allocator.kv_cache.moves == [
         ([40, 41, 42], [0, 1, 2]),
     ]
+
+
+def test_prefix_slices_on_same_partial_page_share_tail_lease() -> None:
+    bridge = make_bridge()
+    bridge.set_prefix_slots(torch.tensor([0, 1, 2], dtype=torch.long))
+    routes = [
+        RouteState(
+            route_id=1,
+            stage1_root_id=1,
+            parent_route_id=None,
+            materialized_leaf_node_id=None,
+            pending_token_id=7,
+            cumulative_logprob=0.0,
+            stage1_depth=0,
+            stage2_depth=0,
+            kv_view=RouteKVView(
+                prefix=PrefixKVView(committed_length=2),
+                node_ids=(),
+            ),
+        ),
+        RouteState(
+            route_id=2,
+            stage1_root_id=2,
+            parent_route_id=None,
+            materialized_leaf_node_id=None,
+            pending_token_id=8,
+            cumulative_logprob=0.0,
+            stage1_depth=0,
+            stage2_depth=0,
+            kv_view=RouteKVView(
+                prefix=PrefixKVView(committed_length=3),
+                node_ids=(),
+            ),
+        ),
+    ]
+    slot_paths = [bridge._slot_path_for_route(route) for route in routes]
+
+    assert bridge.route_tail_page_keys[1] == bridge.route_tail_page_keys[2]
+    copied = bridge._copy_partial_tail_pages(routes, slot_paths)
+
+    assert copied[0].tolist() == [0, 1]
+    assert copied[1].tolist() == [40, 41, 42]
+    assert bridge.cow_pages_copied == 1
+    assert bridge.hot_path_counters()["hot_path_host_transfer_batches"] == 0
 
 
 def test_distinct_partial_tail_pages_are_not_copied_in_batch() -> None:
@@ -229,6 +275,77 @@ def test_page_reference_counts_and_selected_promotion_release() -> None:
     assert released == 1
     assert bridge.owned_page_ids == {0, 10}
     assert bridge.token_to_kv_pool_allocator.freed == [44]
+
+
+def test_pending_owned_pages_are_materialized_once_before_release() -> None:
+    bridge = make_bridge()
+    bridge.set_prefix_slots(torch.tensor([0, 1], dtype=torch.long))
+    bridge.route_slot_paths[1] = torch.tensor([0, 1, 40], dtype=torch.long)
+    bridge._record_pending_owned_slots(torch.tensor([40, 41, 44], dtype=torch.long))
+
+    released = bridge.release_unreferenced_node_slots([])
+
+    assert released == 1
+    assert bridge.pending_owned_slot_tensors == []
+    assert bridge.owned_page_ids == {0, 10}
+    assert bridge.token_to_kv_pool_allocator.freed == [44]
+    assert bridge.release_unreferenced_node_slots([]) == 0
+    assert bridge.token_to_kv_pool_allocator.freed == [44]
+
+
+def test_tail_lease_propagates_through_reconcile_retain_commit_and_clear() -> None:
+    bridge = make_bridge()
+    bridge.set_prefix_slots(torch.tensor([40, 41, 42], dtype=torch.long))
+    parent = RouteState(
+        route_id=1,
+        stage1_root_id=1,
+        parent_route_id=None,
+        materialized_leaf_node_id=None,
+        pending_token_id=7,
+        cumulative_logprob=0.0,
+        stage1_depth=0,
+        stage2_depth=0,
+        kv_view=RouteKVView(
+            prefix=PrefixKVView(committed_length=3),
+            node_ids=(),
+        ),
+    )
+    children = [
+        RouteState(
+            route_id=route_id,
+            stage1_root_id=route_id,
+            parent_route_id=1,
+            materialized_leaf_node_id=None,
+            pending_token_id=8,
+            cumulative_logprob=0.0,
+            stage1_depth=0,
+            stage2_depth=0,
+            kv_view=parent.kv_view.fork(),
+        )
+        for route_id in (2, 3)
+    ]
+    bridge._slot_path_for_route(parent)
+
+    bridge.reconcile_route_rows([parent], children)
+    parent_key = bridge.route_tail_page_keys[1]
+    assert bridge.route_tail_page_keys[2] == parent_key
+    assert bridge.route_tail_page_keys[3] == parent_key
+
+    bridge.retain_route_rows([2])
+    bridge.commit_route_as_prefix(children[0])
+
+    assert bridge.prefix_slot_count == 3
+    assert bridge.prefix_page_ids == {10}
+    assert bridge.prefix_tail_page_key == parent_key
+    assert bridge.prefix_partial_tail_keys == {0: parent_key}
+    assert bridge.route_tail_page_keys == {2: parent_key}
+
+    bridge.clear_physical_state()
+    assert bridge.prefix_slot_count == 0
+    assert bridge.prefix_page_ids == set()
+    assert bridge.prefix_tail_page_key is None
+    assert bridge.prefix_partial_tail_keys == {}
+    assert bridge.route_tail_page_keys == {}
 
 
 def test_req_row_full_rewrite_counters_record_written_elements() -> None:

@@ -420,7 +420,7 @@ def main() -> int:
                 "req_pool_row_count": len(frontier_backend.route_pool.route_rows),
                 "node_slot_count": len(frontier_backend.route_pool.node_slot_ids),
                 "route_slot_path_count": len(frontier_backend.route_pool.route_slot_paths),
-                "owned_page_count": len(frontier_backend.route_pool.owned_page_ids),
+                "owned_page_count": frontier_backend.route_pool.owned_page_count(),
                 "cow_pages_copied": frontier_backend.route_pool.cow_pages_copied,
                 "cow_tokens_copied": frontier_backend.route_pool.cow_tokens_copied,
                 "prefix_slot_count": int(prefill.prefix_slot_ids.numel()),

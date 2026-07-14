@@ -24,6 +24,8 @@ class SGLangRouteKVMetadata:
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     orig_seq_lens: torch.Tensor | None = None
+    seq_lens_sum: int | None = None
+    seq_lens_cpu: torch.Tensor | None = None
     attention_page_size: int = 1
     token_index_count: int = 0
     page_index_count: int = 0
@@ -114,10 +116,18 @@ class SGLangFlashInferPagedDecodeBackend(FlashInferBackendBase):
             req_pool_indices=metadata.req_pool_indices,
             seq_lens=metadata.seq_lens,
             out_cache_loc=metadata.out_cache_loc,
-            seq_lens_sum=int(metadata.seq_lens.sum().item()),
+            seq_lens_sum=(
+                int(metadata.seq_lens_sum)
+                if metadata.seq_lens_sum is not None
+                else int(metadata.seq_lens.sum().item())
+            ),
             orig_seq_lens=metadata.orig_seq_lens,
             positions=metadata.positions,
-            seq_lens_cpu=metadata.seq_lens.detach().cpu(),
+            seq_lens_cpu=(
+                metadata.seq_lens_cpu
+                if metadata.seq_lens_cpu is not None
+                else metadata.seq_lens.detach().cpu()
+            ),
             spec_info=metadata.paged_decode_spec,
             capture_hidden_mode=_capture_hidden_mode_null(),
         )

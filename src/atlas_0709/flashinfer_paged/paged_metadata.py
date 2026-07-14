@@ -39,8 +39,8 @@ def build_flashinfer_paged_kv_metadata(
 
     A division by ``page_size`` is valid only after proving that every logical
     page starts on a physical page boundary and that all valid slots inside the
-    page are contiguous. Validation is vectorized and performs at most one
-    scalar device read for the whole frontier.
+    page are contiguous. Validation is vectorized; CUDA uses an asynchronous
+    device assertion and therefore performs no scalar host read.
     """
 
     if int(page_size) <= 0:
@@ -98,11 +98,8 @@ def build_flashinfer_paged_kv_metadata(
                 )
             )
 
-    if validate_layout and not bool(torch.stack(layout_checks).all().item()):
-        raise RuntimeError(
-            "physical KV slot paths are not page-aligned contiguous pages; "
-            "cannot safely compress token slots into FlashInfer page indices"
-        )
+    if validate_layout:
+        _assert_layout_valid(torch.stack(layout_checks).all())
 
     indptr_values = [0]
     for count in page_counts:
@@ -120,4 +117,23 @@ def build_flashinfer_paged_kv_metadata(
         page_size=int(page_size),
         token_index_count=int(token_index_count),
         layout_validated=bool(validate_layout),
+    )
+
+
+def _assert_layout_valid(condition: torch.Tensor) -> None:
+    message = (
+        "physical KV slot paths are not page-aligned contiguous pages; "
+        "cannot safely compress token slots into FlashInfer page indices"
+    )
+    if condition.device.type == "cpu":
+        if not bool(condition.item()):
+            raise RuntimeError(message)
+        return
+    assert_async = getattr(torch, "_assert_async", None)
+    if callable(assert_async):
+        assert_async(condition, message)
+        return
+    raise RuntimeError(
+        "CUDA page-layout validation requires torch._assert_async to avoid "
+        "a device-to-host synchronization"
     )
