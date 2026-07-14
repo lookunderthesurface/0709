@@ -1025,6 +1025,20 @@ def _paired_numeric_summary(values: Sequence[float]) -> dict[str, object]:
     }
 
 
+def _paired_ratio_summary(values: Sequence[float]) -> dict[str, object]:
+    samples = [float(value) for value in values]
+    if not samples or min(samples) <= 0.0:
+        raise ValueError("paired ratios must be positive")
+    return {
+        "median": float(statistics.median(samples)),
+        "geometric_mean": float(
+            math.exp(statistics.fmean(math.log(value) for value in samples))
+        ),
+        "arithmetic_mean_diagnostic": float(statistics.fmean(samples)),
+        "samples": samples,
+    }
+
+
 def measure_paired_critical_path_components(
     *,
     setup_a: Callable[[], Any],
@@ -1136,7 +1150,7 @@ def measure_paired_critical_path_components(
         "blocks": blocks,
         "total": {
             "delta_b_minus_a_ms": _paired_numeric_summary(block_deltas),
-            "geometric_ratio_b_over_a": _paired_numeric_summary(block_ratios),
+            "geometric_ratio_b_over_a": _paired_ratio_summary(block_ratios),
             "unpaired_mean_ratio_b_over_a_diagnostic": (
                 arm_b.total.mean_ms / arm_a.total.mean_ms
             ),
@@ -1443,7 +1457,7 @@ def main() -> int:
                         "route_materialization": False,
                         "candidate_host_transfer": False,
                         "setup_and_prefill_included": False,
-                        "decode_ready_req_rows_and_tail_cow_excluded": True,
+                        "initial_req_rows_and_initial_tail_cow_excluded": True,
                         **paired_tree.arm_a.to_dict(),
                     }
                     report[tree_ready_key] = {
@@ -1453,7 +1467,7 @@ def main() -> int:
                         "final_sequence_length": len(prompt_token_ids) + int(args.d),
                         "model_input_tokens": int(args.k * args.d),
                         "setup_and_prefill_included": False,
-                        "decode_ready_req_rows_and_tail_cow_excluded": True,
+                        "initial_req_rows_and_initial_tail_cow_excluded": True,
                         **paired_tree.arm_b.to_dict(),
                     }
                     report[tree_pair_key] = {
@@ -1466,7 +1480,9 @@ def main() -> int:
                     }
                     tree_pair_total = paired_tree.paired_comparison["total"]
                     tree_pair_ratio = float(
-                        tree_pair_total["geometric_ratio_b_over_a"]["mean"]
+                        tree_pair_total["geometric_ratio_b_over_a"][
+                            "geometric_mean"
+                        ]
                     )
                     tree_pair_delta = float(
                         tree_pair_total["delta_b_minus_a_ms"]["mean"]
@@ -1607,7 +1623,7 @@ def main() -> int:
                         "route_materialization": False,
                         "candidate_host_transfer": False,
                         "setup_and_prefill_included": False,
-                        "decode_ready_req_rows_and_tail_cow_excluded": True,
+                        "initial_req_rows_and_initial_tail_cow_excluded": True,
                         **paired_forest.arm_a.to_dict(),
                     }
                     report[forest_ready_key] = {
@@ -1617,7 +1633,7 @@ def main() -> int:
                         "final_sequence_length": forest_initial_length + int(args.d),
                         "model_input_tokens": int(args.k * args.k * args.d),
                         "setup_and_prefill_included": False,
-                        "decode_ready_req_rows_and_tail_cow_excluded": True,
+                        "initial_req_rows_and_initial_tail_cow_excluded": True,
                         **paired_forest.arm_b.to_dict(),
                     }
                     report[forest_pair_key] = {
@@ -1630,7 +1646,9 @@ def main() -> int:
                     }
                     forest_pair_total = paired_forest.paired_comparison["total"]
                     forest_pair_ratio = float(
-                        forest_pair_total["geometric_ratio_b_over_a"]["mean"]
+                        forest_pair_total["geometric_ratio_b_over_a"][
+                            "geometric_mean"
+                        ]
                     )
                     forest_pair_delta = float(
                         forest_pair_total["delta_b_minus_a_ms"]["mean"]

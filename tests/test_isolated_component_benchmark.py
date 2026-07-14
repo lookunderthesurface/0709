@@ -7,6 +7,7 @@ import torch
 from benchmarks.bench_atlas_0709_isolated_components import (
     NativeBatchARState,
     PerRouteTop1Selection,
+    _paired_ratio_summary,
     measure_paired_critical_path_components,
     measure_stepped_component,
     run_native_batch_ar_step,
@@ -265,6 +266,12 @@ def test_paired_critical_path_rejects_incomplete_abba_block() -> None:
         assert "positive even" in str(exc)
     else:
         raise AssertionError("incomplete ABBA block did not raise ValueError")
+
+
+def test_paired_ratio_aggregates_blocks_geometrically() -> None:
+    summary = _paired_ratio_summary([1.0, 4.0])
+    assert summary["geometric_mean"] == 2.0
+    assert summary["arithmetic_mean_diagnostic"] == 2.5
 
 
 class FakeNativeReqPool:
