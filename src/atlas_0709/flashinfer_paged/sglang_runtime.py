@@ -53,6 +53,8 @@ class SGLangRouteRow:
     route_id: int
     req_pool_index: int
     handle: Any
+    written_length: int = 0
+    pending_dirty_start: int | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,12 @@ class SGLangRoutePoolBridge:
     req_row_elements_written: int = 0
     req_row_full_rewrite_calls: int = 0
     req_row_full_rewrite_elements: int = 0
+    req_row_full_init_calls: int = 0
+    req_row_full_init_elements: int = 0
+    req_row_append_calls: int = 0
+    req_row_append_elements: int = 0
+    req_row_cow_patch_calls: int = 0
+    req_row_cow_patch_elements: int = 0
     use_page_attention_metadata: bool = True
     validate_page_layout: bool = True
 
@@ -162,13 +170,23 @@ class SGLangRoutePoolBridge:
         }
         self.owned_page_ids = set(self.prefix_page_ids)
 
-    def bind_existing_route_row(self, route_id: int, req_pool_index: int, handle: Any | None = None) -> None:
+    def bind_existing_route_row(
+        self,
+        route_id: int,
+        req_pool_index: int,
+        handle: Any | None = None,
+        *,
+        written_length: int = 0,
+    ) -> None:
+        if int(written_length) < 0:
+            raise ValueError("written_length must be non-negative")
         if handle is None:
             handle = _PoolReqHandle(rid=f"atlas-{int(route_id)}", req_pool_idx=int(req_pool_index))
         self.route_rows[int(route_id)] = SGLangRouteRow(
             route_id=int(route_id),
             req_pool_index=int(req_pool_index),
             handle=handle,
+            written_length=int(written_length),
         )
 
     def ensure_route_rows(self, routes: Sequence[RouteState]) -> torch.Tensor:
@@ -248,6 +266,8 @@ class SGLangRoutePoolBridge:
                     route_id=int(child.route_id),
                     req_pool_index=row.req_pool_index,
                     handle=row.handle,
+                    written_length=row.written_length,
+                    pending_dirty_start=row.pending_dirty_start,
                 )
                 continue
 
@@ -349,6 +369,12 @@ class SGLangRoutePoolBridge:
         self.req_row_elements_written = 0
         self.req_row_full_rewrite_calls = 0
         self.req_row_full_rewrite_elements = 0
+        self.req_row_full_init_calls = 0
+        self.req_row_full_init_elements = 0
+        self.req_row_append_calls = 0
+        self.req_row_append_elements = 0
+        self.req_row_cow_patch_calls = 0
+        self.req_row_cow_patch_elements = 0
         clear_req_pool = getattr(self.req_to_token_pool, "clear", None)
         if callable(clear_req_pool):
             clear_req_pool()
@@ -473,10 +499,28 @@ class SGLangRoutePoolBridge:
         routes: Sequence[RouteState],
         slot_paths: Sequence[torch.Tensor],
     ) -> list[torch.Tensor]:
+        copied_paths, _ = self._copy_partial_tail_pages_with_dirty_starts(
+            routes,
+            slot_paths,
+        )
+        return copied_paths
+
+    def _copy_partial_tail_pages_with_dirty_starts(
+        self,
+        routes: Sequence[RouteState],
+        slot_paths: Sequence[torch.Tensor],
+    ) -> tuple[list[torch.Tensor], dict[int, int]]:
+        """Copy shared partial tails and return changed req-row offsets.
+
+        The returned mapping is keyed by the route's position in ``routes``.
+        Its value is the first logical token position whose physical slot id
+        changed, so an already initialized request row can patch only the COW
+        tail instead of replaying its full prefix.
+        """
         if len(routes) != len(slot_paths):
             raise ValueError("routes and slot_paths must have the same length")
         if len(routes) <= 1:
-            return list(slot_paths)
+            return list(slot_paths), {}
 
         # Only active writers that point at the same partial physical page need
         # copy-on-write.  Distinct partial pages are already private.  For N
@@ -505,9 +549,10 @@ class SGLangRoutePoolBridge:
 
         copy_plan = [entry for group in partial_groups.values() for entry in group[1:]]
         if not copy_plan:
-            return result
+            return result, {}
 
         destination_pages = self._allocate_full_pages(len(copy_plan))
+        dirty_starts: dict[int, int] = {}
         for destination_page, (index, slot_path, tail_len) in zip(
             destination_pages,
             copy_plan,
@@ -519,9 +564,10 @@ class SGLangRoutePoolBridge:
             route_id = int(routes[index].route_id)
             self.route_slot_paths[route_id] = copied_path
             result[index] = copied_path
+            dirty_starts[index] = int(slot_path.numel()) - int(tail_len)
             self.cow_pages_copied += 1
             self.cow_tokens_copied += int(tail_len)
-        return result
+        return result, dirty_starts
 
     def prepare_frontier(
         self,
@@ -538,7 +584,18 @@ class SGLangRoutePoolBridge:
             dtype=torch.long,
         )
         slot_paths = [self._slot_path_for_route(route) for route in active_routes]
-        slot_paths = self._copy_partial_tail_pages(active_routes, slot_paths)
+        slot_paths, cow_dirty_starts = self._copy_partial_tail_pages_with_dirty_starts(
+            active_routes,
+            slot_paths,
+        )
+        for route_index, dirty_start in cow_dirty_starts.items():
+            row = self.route_rows[int(active_routes[route_index].route_id)]
+            if int(row.written_length) > 0:
+                row.pending_dirty_start = (
+                    int(dirty_start)
+                    if row.pending_dirty_start is None
+                    else min(int(row.pending_dirty_start), int(dirty_start))
+                )
         seq_lens: list[int] = []
         last_locs: list[int] = []
         for slot_path in slot_paths:
@@ -568,7 +625,14 @@ class SGLangRoutePoolBridge:
         positions: list[int] = []
         full_slot_paths: list[torch.Tensor] = []
 
-        for slot_path, req_pool_index, output_slot in zip(slot_paths, _int_list(req_pool_indices), _int_list(output_slot_ids)):
+        req_pool_index_list = _int_list(req_pool_indices)
+        output_slot_list = _int_list(output_slot_ids)
+        for route, slot_path, req_pool_index, output_slot in zip(
+            active_routes,
+            slot_paths,
+            req_pool_index_list,
+            output_slot_list,
+        ):
             full_slot_path = torch.cat(
                 [
                     slot_path,
@@ -576,8 +640,37 @@ class SGLangRoutePoolBridge:
                 ],
                 dim=0,
             )
-            self._write_req_token_row(int(req_pool_index), full_slot_path)
-            route = active_routes[len(positions)]
+            row = self.route_rows[int(route.route_id)]
+            previous_len = int(slot_path.numel())
+            if int(row.written_length) == 0:
+                write_start = 0
+                write_values = full_slot_path
+                write_kind = "full_init"
+            else:
+                if int(row.written_length) != previous_len:
+                    raise RuntimeError(
+                        "SGLang route-row state does not match its physical KV path: "
+                        f"route_id={int(route.route_id)}, "
+                        f"written_length={int(row.written_length)}, "
+                        f"physical_path_length={previous_len}"
+                    )
+                dirty_start = row.pending_dirty_start
+                if dirty_start is None:
+                    write_start = previous_len
+                    write_values = full_slot_path[previous_len:]
+                    write_kind = "append"
+                else:
+                    write_start = int(dirty_start)
+                    write_values = full_slot_path[write_start:]
+                    write_kind = "cow_patch"
+            self._write_req_token_slice(
+                int(req_pool_index),
+                write_start,
+                write_values,
+                write_kind=write_kind,
+            )
+            row.written_length = int(full_slot_path.numel())
+            row.pending_dirty_start = None
             self.route_slot_paths[int(route.route_id)] = full_slot_path
             seq_len = int(full_slot_path.numel())
             positions.append(seq_len - 1)
@@ -668,33 +761,75 @@ class SGLangRoutePoolBridge:
         return slot_path
 
     def _write_req_token_row(self, req_pool_index: int, slot_path: torch.Tensor) -> None:
-        slot_len = int(slot_path.numel())
-        self.req_row_write_calls += 1
-        self.req_row_elements_written += slot_len
-        self.req_row_full_rewrite_calls += 1
-        self.req_row_full_rewrite_elements += slot_len
+        self._write_req_token_slice(
+            req_pool_index,
+            0,
+            slot_path,
+            write_kind="full_init",
+        )
+
+    def _write_req_token_slice(
+        self,
+        req_pool_index: int,
+        start: int,
+        slot_ids: torch.Tensor,
+        *,
+        write_kind: str,
+    ) -> None:
+        if write_kind not in {"full_init", "append", "cow_patch"}:
+            raise ValueError(f"unknown req-row write kind: {write_kind}")
+        write_start = int(start)
+        if write_start < 0:
+            raise ValueError("req-row write start must be non-negative")
+        values = _as_1d_long_tensor(slot_ids, device=self.device)
+        write_count = int(values.numel())
+        if write_count <= 0:
+            raise ValueError("req-row write cannot be empty")
+        write_end = write_start + write_count
         capacity = _req_to_token_pool_context_capacity(self.req_to_token_pool)
         if capacity is None:
             capacity = self.max_context_len
-        if capacity is not None and slot_len > int(capacity):
+        if capacity is not None and write_end > int(capacity):
             raise RuntimeError(
                 "SGLang req_to_token_pool row is too short for the requested prefix. "
-                f"slot_path_len={slot_len}, req_pool_context_capacity={int(capacity)}, "
+                f"write_end={write_end}, req_pool_context_capacity={int(capacity)}, "
                 f"req_pool_index={int(req_pool_index)}. Increase --context-length or recreate "
                 "the runner with a larger ReqToTokenPool."
             )
         try:
-            self.req_to_token_pool.write((int(req_pool_index), slice(0, slot_len)), slot_path)
-            return
+            self.req_to_token_pool.write(
+                (int(req_pool_index), slice(write_start, write_end)),
+                values,
+            )
         except Exception:
-            pass
-        positions = torch.arange(slot_len, device=slot_path.device, dtype=torch.long)
-        req_indices = torch.full_like(positions, int(req_pool_index))
-        try:
-            self.req_to_token_pool.write((req_indices, positions), slot_path)
-            return
-        except Exception as exc:
-            raise RuntimeError("failed to write SGLang req_to_token_pool route row") from exc
+            positions = torch.arange(
+                write_start,
+                write_end,
+                device=values.device,
+                dtype=torch.long,
+            )
+            req_indices = torch.full_like(positions, int(req_pool_index))
+            try:
+                self.req_to_token_pool.write((req_indices, positions), values)
+            except Exception as exc:
+                raise RuntimeError("failed to write SGLang req_to_token_pool route row") from exc
+
+        # Counters describe successful writes only.  The legacy full-rewrite
+        # names remain as compatibility aliases for full row initialization;
+        # they no longer count every decode step.
+        self.req_row_write_calls += 1
+        self.req_row_elements_written += write_count
+        if write_kind == "full_init":
+            self.req_row_full_init_calls += 1
+            self.req_row_full_init_elements += write_count
+            self.req_row_full_rewrite_calls += 1
+            self.req_row_full_rewrite_elements += write_count
+        elif write_kind == "append":
+            self.req_row_append_calls += 1
+            self.req_row_append_elements += write_count
+        else:
+            self.req_row_cow_patch_calls += 1
+            self.req_row_cow_patch_elements += write_count
 
     def hot_path_counters(self) -> dict[str, int]:
         return {
@@ -707,6 +842,12 @@ class SGLangRoutePoolBridge:
             "req_row_elements_written": int(self.req_row_elements_written),
             "req_row_full_rewrite_calls": int(self.req_row_full_rewrite_calls),
             "req_row_full_rewrite_elements": int(self.req_row_full_rewrite_elements),
+            "req_row_full_init_calls": int(self.req_row_full_init_calls),
+            "req_row_full_init_elements": int(self.req_row_full_init_elements),
+            "req_row_append_calls": int(self.req_row_append_calls),
+            "req_row_append_elements": int(self.req_row_append_elements),
+            "req_row_cow_patch_calls": int(self.req_row_cow_patch_calls),
+            "req_row_cow_patch_elements": int(self.req_row_cow_patch_elements),
         }
 
 
