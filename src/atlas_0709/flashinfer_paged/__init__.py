@@ -29,6 +29,7 @@ from .sglang_runtime import (
     prefill_sglang_prefix,
     sglang_runner_component_report,
 )
+from .sglang_page_attention import AtlasPagedDecodeSpec, reshape_token_kv_cache_as_pages
 from .types import (
     BuildDepthsOutput,
     DecodePhase,
@@ -43,6 +44,7 @@ from .types import (
 
 __all__ = [
     "BuildDepthsOutput",
+    "AtlasPagedDecodeSpec",
     "DecodePhase",
     "DraftPrefixState",
     "FrontierDecodeOutput",
@@ -72,5 +74,6 @@ __all__ = [
     "initialize_forest_routes",
     "initialize_stage1_routes",
     "prefill_sglang_prefix",
+    "reshape_token_kv_cache_as_pages",
     "sglang_runner_component_report",
 ]

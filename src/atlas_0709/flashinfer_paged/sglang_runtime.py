@@ -16,6 +16,8 @@ from .flashinfer_backends import (
     _import_attr_any,
 )
 from .kv import KVTreeStore
+from .paged_metadata import build_flashinfer_paged_kv_metadata
+from .sglang_page_attention import AtlasPagedDecodeSpec, install_atlas_paged_decode_attention
 from .types import DraftPrefixState, FrontierDecodeOutput, PrefixKVView, RouteState
 
 
@@ -42,6 +44,8 @@ class SGLangRunnerConfig:
     disable_radix_cache: bool = True
     disable_cuda_graph: bool = True
     skip_server_warmup: bool = True
+    use_page_attention_metadata: bool = True
+    validate_page_layout: bool = True
 
 
 @dataclass
@@ -104,6 +108,8 @@ class SGLangRoutePoolBridge:
     req_row_elements_written: int = 0
     req_row_full_rewrite_calls: int = 0
     req_row_full_rewrite_elements: int = 0
+    use_page_attention_metadata: bool = True
+    validate_page_layout: bool = True
 
     @classmethod
     def from_runner(
@@ -140,6 +146,12 @@ class SGLangRoutePoolBridge:
             page_size=page_size,
             max_context_len=int(max_context_len) if max_context_len is not None else None,
             device=device,
+            use_page_attention_metadata=bool(
+                getattr(model_runner, "atlas_use_page_attention_metadata", True)
+            ),
+            validate_page_layout=bool(
+                getattr(model_runner, "atlas_validate_page_layout", True)
+            ),
         )
 
     def set_prefix_slots(self, slot_ids: Sequence[int] | torch.Tensor) -> None:
@@ -500,6 +512,7 @@ class SGLangRoutePoolBridge:
         )
 
         positions: list[int] = []
+        full_slot_paths: list[torch.Tensor] = []
 
         for slot_path, req_pool_index, output_slot in zip(slot_paths, _int_list(req_pool_indices), _int_list(output_slot_ids)):
             full_slot_path = torch.cat(
@@ -514,21 +527,40 @@ class SGLangRoutePoolBridge:
             self.route_slot_paths[int(route.route_id)] = full_slot_path
             seq_len = int(full_slot_path.numel())
             positions.append(seq_len - 1)
+            full_slot_paths.append(full_slot_path)
 
         seq_lens_tensor = torch.tensor(seq_lens, device=self.device, dtype=torch.long)
         token_index_count = int(sum(seq_lens))
+        paged_decode_spec = None
+        attention_page_size = 1
+        page_index_count = token_index_count
+        if self.use_page_attention_metadata:
+            paged = build_flashinfer_paged_kv_metadata(
+                full_slot_paths,
+                page_size=self.page_size,
+                validate_layout=self.validate_page_layout,
+            )
+            paged_decode_spec = AtlasPagedDecodeSpec(
+                kv_indptr=paged.kv_indptr,
+                kv_indices=paged.kv_page_indices,
+                kv_last_page_len=paged.kv_last_page_len,
+                page_size=int(paged.page_size),
+            )
+            attention_page_size = int(paged.page_size)
+            page_index_count = int(paged.page_index_count)
         self.attention_metadata_builds += 1
         self.attention_metadata_token_indices += token_index_count
-        self.attention_metadata_page_indices += token_index_count
+        self.attention_metadata_page_indices += page_index_count
         metadata = SGLangRouteKVMetadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens_tensor,
             out_cache_loc=output_slot_ids,
             positions=torch.tensor(positions, device=self.device, dtype=torch.long),
             orig_seq_lens=seq_lens_tensor,
-            attention_page_size=1,
+            attention_page_size=attention_page_size,
             token_index_count=token_index_count,
-            page_index_count=token_index_count,
+            page_index_count=page_index_count,
+            paged_decode_spec=paged_decode_spec,
         )
         return input_ids, metadata
 
@@ -917,6 +949,12 @@ def create_sglang_model_runner(
         req_to_token_pool=pool_bundle.req_to_token_pool,
         token_to_kv_pool_allocator=pool_bundle.token_to_kv_pool_allocator,
     )
+    setattr(
+        runner,
+        "atlas_use_page_attention_metadata",
+        bool(config.use_page_attention_metadata),
+    )
+    setattr(runner, "atlas_validate_page_layout", bool(config.validate_page_layout))
     attach_sglang_memory_pools(runner, pool_bundle)
     ensure_sglang_runner_runtime_defaults(runner)
     if initialize:
@@ -1158,14 +1196,18 @@ def ensure_sglang_flashinfer_attention_backend(model_runner: Any) -> Any:
         ("attn_backend", "attention_backend", "decode_attn_backend"),
     )
     if existing is not None and "flashinfer" in type(existing).__name__.lower():
-        return existing
+        backend = existing
+    else:
+        FlashInferAttnBackend = _import_attr(
+            "sglang.srt.layers.attention.flashinfer_backend",
+            "FlashInferAttnBackend",
+        )
+        backend = FlashInferAttnBackend(model_runner)
+        setattr(model_runner, "attn_backend", backend)
 
-    FlashInferAttnBackend = _import_attr(
-        "sglang.srt.layers.attention.flashinfer_backend",
-        "FlashInferAttnBackend",
-    )
-    backend = FlashInferAttnBackend(model_runner)
-    setattr(model_runner, "attn_backend", backend)
+    page_size = int(getattr(model_runner, "atlas_pool_page_size", 1) or 1)
+    if bool(getattr(model_runner, "atlas_use_page_attention_metadata", True)):
+        install_atlas_paged_decode_attention(backend, page_size=page_size)
     return backend
 
 
@@ -1209,6 +1251,18 @@ def sglang_runner_component_report(model_runner: Any) -> dict[str, Any]:
         "server_attention_backend": getattr(server_args, "attention_backend", None),
         "server_prefill_attention_backend": getattr(server_args, "prefill_attention_backend", None),
         "server_decode_attention_backend": getattr(server_args, "decode_attention_backend", None),
+        "atlas_use_page_attention_metadata": bool(
+            getattr(model_runner, "atlas_use_page_attention_metadata", True)
+        ),
+        "atlas_validate_page_layout": bool(
+            getattr(model_runner, "atlas_validate_page_layout", True)
+        ),
+        "atlas_attention_metadata_page_size": int(
+            getattr(attn_backend, "atlas_paged_decode_page_size", 1)
+        ),
+        "atlas_paged_decode_enabled": bool(
+            getattr(attn_backend, "atlas_paged_decode_enabled", False)
+        ),
     }
 
 

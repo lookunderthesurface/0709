@@ -127,6 +127,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-tree", action="store_true")
     parser.add_argument("--skip-forest", action="store_true")
     parser.add_argument("--skip-verify", action="store_true")
+    parser.add_argument(
+        "--legacy-token-attention-metadata",
+        action="store_true",
+        help="Use SGLang's page_size=1 token metadata for a matched A/B baseline.",
+    )
+    parser.add_argument(
+        "--skip-page-layout-validation",
+        action="store_true",
+        help="Skip ATLAS physical page-layout validation during timed diagnostics.",
+    )
     parser.add_argument("--json-out", default=None)
     return parser
 
@@ -410,6 +420,12 @@ def main() -> int:
             "dtype": args.dtype,
             "warmup": int(args.warmup),
             "iters": int(args.iters),
+            "attention_metadata_mode": (
+                "legacy_token_page_size_1"
+                if args.legacy_token_attention_metadata
+                else f"physical_page_size_{int(args.page_size)}"
+            ),
+            "page_layout_validation": not args.skip_page_layout_validation,
         }
     }
 
@@ -427,6 +443,8 @@ def main() -> int:
                 gpu_id=args.gpu_id,
                 nccl_port=args.nccl_port,
                 trust_remote_code=args.trust_remote_code,
+                use_page_attention_metadata=not args.legacy_token_attention_metadata,
+                validate_page_layout=not args.skip_page_layout_validation,
             )
             runner = create_sglang_model_runner(runner_config, initialize=True)
             report["drafter_runtime"] = sglang_runner_component_report(runner)

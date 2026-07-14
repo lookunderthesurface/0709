@@ -1,7 +1,14 @@
+from types import SimpleNamespace
+
 import torch
 
 from atlas_0709.flashinfer_paged.paged_metadata import (
     build_flashinfer_paged_kv_metadata,
+)
+from atlas_0709.flashinfer_paged.sglang_page_attention import (
+    AtlasPagedDecodeSpec,
+    install_atlas_paged_decode_attention,
+    reshape_token_kv_cache_as_pages,
 )
 
 
@@ -58,3 +65,82 @@ def test_layout_validation_rejects_unaligned_or_noncontiguous_slots() -> None:
             pass
         else:
             raise AssertionError(f"invalid physical page layout was accepted: {path.tolist()}")
+
+
+def test_flat_sglang_kv_cache_is_viewed_as_physical_pages() -> None:
+    cache = torch.arange(8 * 2 * 3, dtype=torch.float32).reshape(8, 2, 3)
+    paged = reshape_token_kv_cache_as_pages(cache, page_size=4)
+
+    assert paged.shape == (2, 4, 2, 3)
+    assert paged.data_ptr() == cache.data_ptr()
+    assert paged[1, 2].tolist() == cache[6].tolist()
+
+
+def test_dedicated_updater_passes_real_page_size_and_preserves_legacy_fallback() -> None:
+    class FakeUpdater:
+        num_qo_heads = 8
+        num_kv_heads = 2
+        head_dim = 64
+        data_type = torch.float16
+        q_data_type = torch.float16
+
+        def __init__(self) -> None:
+            self.legacy_calls = 0
+
+        def call_begin_forward(self, *args, **kwargs) -> None:
+            self.legacy_calls += 1
+
+    class FakeWrapper:
+        is_cuda_graph_enabled = False
+
+        def __init__(self) -> None:
+            self.args = None
+            self.kwargs = None
+
+        def begin_forward(self, *args, **kwargs) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    updater = FakeUpdater()
+    backend = SimpleNamespace(
+        dispatch_reason=None,
+        indices_updater_decode=updater,
+        forward_decode=lambda *args, **kwargs: None,
+    )
+    install_atlas_paged_decode_attention(backend, page_size=16)
+
+    spec = AtlasPagedDecodeSpec(
+        kv_indptr=torch.tensor([0, 2], dtype=torch.int32),
+        kv_indices=torch.tensor([5, 9], dtype=torch.int32),
+        kv_last_page_len=torch.tensor([3], dtype=torch.int32),
+        page_size=16,
+    )
+    wrapper = FakeWrapper()
+    updater.call_begin_forward(
+        wrapper,
+        torch.tensor([1]),
+        torch.tensor([19]),
+        19,
+        torch.tensor([0, 19]),
+        None,
+        spec,
+        torch.tensor([19]),
+    )
+
+    assert wrapper.args[0] is spec.kv_indptr
+    assert wrapper.args[1] is spec.kv_indices
+    assert wrapper.args[2] is spec.kv_last_page_len
+    assert wrapper.args[6] == 16
+    assert updater.legacy_calls == 0
+
+    updater.call_begin_forward(
+        wrapper,
+        torch.tensor([1]),
+        torch.tensor([19]),
+        19,
+        torch.tensor([0, 19]),
+        None,
+        None,
+        torch.tensor([19]),
+    )
+    assert updater.legacy_calls == 1

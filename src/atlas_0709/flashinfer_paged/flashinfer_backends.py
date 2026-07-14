@@ -6,6 +6,7 @@ from typing import Any
 import torch
 
 from .runtime_metadata import package_version
+from .sglang_page_attention import AtlasPagedDecodeSpec
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class SGLangRouteKVMetadata:
     attention_page_size: int = 1
     token_index_count: int = 0
     page_index_count: int = 0
+    paged_decode_spec: AtlasPagedDecodeSpec | None = None
 
 
 class FlashInferBackendBase:
@@ -116,6 +118,7 @@ class SGLangFlashInferPagedDecodeBackend(FlashInferBackendBase):
             orig_seq_lens=metadata.orig_seq_lens,
             positions=metadata.positions,
             seq_lens_cpu=metadata.seq_lens.detach().cpu(),
+            spec_info=metadata.paged_decode_spec,
             capture_hidden_mode=_capture_hidden_mode_null(),
         )
         output = self.model_runner.forward(forward_batch)

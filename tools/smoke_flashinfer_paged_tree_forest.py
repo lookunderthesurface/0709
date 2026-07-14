@@ -51,6 +51,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nccl-port", type=int, default=29500)
     parser.add_argument("--skip-forest", action="store_true")
     parser.add_argument(
+        "--legacy-token-attention-metadata",
+        action="store_true",
+        help="Use SGLang's legacy page_size=1 token-index updater for A/B validation.",
+    )
+    parser.add_argument(
+        "--skip-page-layout-validation",
+        action="store_true",
+        help="Skip the physical page-layout assertion (benchmark diagnostics only).",
+    )
+    parser.add_argument("--json-out", default=None)
+    parser.add_argument(
         "--check-hf-logits",
         action="store_true",
         help="Load a second HF model and compare every tree/forest frontier against full-history logits.",
@@ -101,6 +112,26 @@ def summarize_build(build: Any) -> dict[str, Any]:
                 "next_route_count": len(step.next_routes),
                 "candidate_count": len(step.candidates),
                 "selected_candidate_count": len(step.selected_candidates),
+                "selected_candidate_signature": [
+                    {
+                        "parent_route_id": int(candidate.parent_route_id),
+                        "stage1_root_id": int(candidate.stage1_root_id),
+                        "pending_token_id": int(candidate.pending_token_id),
+                        "rank_in_parent": int(candidate.rank_in_parent),
+                        "cumulative_logprob": float(candidate.cumulative_logprob),
+                    }
+                    for candidate in step.selected_candidates
+                ],
+                "next_token_top1_ids": [
+                    int(token_id)
+                    for token_id in torch.argmax(
+                        step.decode_output.next_token_logits,
+                        dim=-1,
+                    )
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ],
                 "logits_shape": list(step.decode_output.next_token_logits.shape),
                 "model_ms": step.decode_output.model_ms,
                 "metadata": dict(step.decode_output.metadata),
@@ -144,7 +175,7 @@ def check_build_alignment(
         candidate = step.decode_output.next_token_logits.float()
         abs_diff = (candidate - reference).abs()
         tolerance = float(atol) + float(rtol) * reference.abs()
-        passed = bool(torch.all(abs_diff <= tolerance).item())
+        logits_within_tolerance = bool(torch.all(abs_diff <= tolerance).item())
         top1_match_rate = float(
             torch.argmax(candidate, dim=-1)
             .eq(torch.argmax(reference, dim=-1))
@@ -152,11 +183,13 @@ def check_build_alignment(
             .mean()
             .item()
         )
+        passed = bool(logits_within_tolerance and top1_match_rate == 1.0)
         all_passed = all_passed and passed
         step_reports.append(
             {
                 "step": step_index,
                 "passed": passed,
+                "logits_within_tolerance": logits_within_tolerance,
                 "batch_size": len(histories),
                 "history_len": next(iter(lengths)),
                 "max_abs_diff": float(abs_diff.max().item()),
@@ -192,6 +225,8 @@ def main() -> int:
             max_total_tokens=args.max_total_tokens,
             gpu_id=args.gpu_id,
             nccl_port=args.nccl_port,
+            use_page_attention_metadata=not args.legacy_token_attention_metadata,
+            validate_page_layout=not args.skip_page_layout_validation,
         )
         runner = create_sglang_model_runner(config, initialize=True)
         route_store = KVTreeStore()
@@ -353,6 +388,12 @@ def main() -> int:
             "k": args.k,
             "d": args.depth,
             "prompt_len": len(prompt_token_ids),
+            "attention_metadata_mode": (
+                "legacy_token_page_size_1"
+                if args.legacy_token_attention_metadata
+                else f"physical_page_size_{args.page_size}"
+            ),
+            "page_layout_validation": not args.skip_page_layout_validation,
             "requested_context_length": args.context_length,
             "effective_context_length": context_length,
             "required_context_length": required_context_length(len(prompt_token_ids), args.depth),
@@ -384,6 +425,14 @@ def main() -> int:
             },
         }
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+        if args.json_out:
+            output = Path(args.json_out)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            print(f"[json] wrote {output}", flush=True)
         if alignment is not None and not alignment["passed"]:
             raise RuntimeError(f"route logits are not aligned: {alignment}")
     finally:
