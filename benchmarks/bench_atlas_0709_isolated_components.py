@@ -654,9 +654,15 @@ def run_native_batch_ar_step(state: NativeBatchARState) -> NativeBatchARStepResu
         device=output_slot_ids.device,
         dtype=torch.long,
     )
+    req_to_token = getattr(bridge.req_to_token_pool, "req_to_token", None)
+    req_row_values = (
+        output_slot_ids
+        if not isinstance(req_to_token, torch.Tensor)
+        else output_slot_ids.to(dtype=req_to_token.dtype)
+    )
     bridge.req_to_token_pool.write(
         (state.req_pool_indices, append_positions),
-        output_slot_ids,
+        req_row_values,
     )
     full_slot_paths = [
         torch.cat((slot_path, output_slot_ids[index : index + 1]), dim=0)

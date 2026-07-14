@@ -269,7 +269,8 @@ def test_paired_critical_path_rejects_incomplete_abba_block() -> None:
 
 class FakeNativeReqPool:
     def __init__(self) -> None:
-        self.table = torch.full((2, 16), -1, dtype=torch.long)
+        self.table = torch.full((2, 16), -1, dtype=torch.int32)
+        self.req_to_token = self.table
         self.write_calls = 0
 
     def write(self, indices, values: torch.Tensor) -> None:
