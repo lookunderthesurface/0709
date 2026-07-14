@@ -6,9 +6,9 @@ import json
 import statistics
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -28,6 +28,7 @@ from atlas_0709.flashinfer_paged.builders import (
     initialize_forest_routes,
     initialize_stage1_routes,
 )
+from atlas_0709.flashinfer_paged.frontier import advance_frontier_one_token
 from atlas_0709.flashinfer_paged.kv import KVTreeStore
 from atlas_0709.flashinfer_paged.sglang_runtime import (
     SGLangFlashInferFrontierModelBackend,
@@ -36,7 +37,14 @@ from atlas_0709.flashinfer_paged.sglang_runtime import (
     prefill_sglang_prefix,
     sglang_runner_component_report,
 )
-from atlas_0709.flashinfer_paged.types import DraftPrefixState, RouteState
+from atlas_0709.flashinfer_paged.types import (
+    DecodePhase,
+    DraftPrefixState,
+    PendingCandidate,
+    PendingCandidateBatch,
+    RouteState,
+)
+from atlas_0709.flashinfer_paged.utils import global_topk_candidates
 from atlas_0709.target_runtime import (
     DirectFlashInferMaskedTreeVerifyBackend,
     VerifyRoutePayload,
@@ -75,15 +83,91 @@ class Timing:
 class SteppedTiming:
     total: Timing
     steps: list[Timing]
+    counter_delta_samples: list[list[dict[str, int]]] = field(default_factory=list)
+    counter_cumulative_samples: list[list[dict[str, int]]] = field(default_factory=list)
+    counter_total_delta_samples: list[dict[str, int]] = field(default_factory=list)
+    measurement_syncs: Mapping[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        step_reports: list[dict[str, object]] = []
+        for index, step_timing in enumerate(self.steps):
+            step_report: dict[str, object] = {
+                "depth": index + 1,
+                **step_timing.to_dict(),
+            }
+            if index < len(self.counter_delta_samples):
+                step_report["hot_path_counter_delta"] = summarize_counter_samples(
+                    self.counter_delta_samples[index]
+                )
+            if index < len(self.counter_cumulative_samples):
+                step_report["hot_path_counter_cumulative"] = summarize_counter_samples(
+                    self.counter_cumulative_samples[index]
+                )
+            step_reports.append(step_report)
+
+        report: dict[str, object] = {
             "total": self.total.to_dict(),
-            "steps": [
-                {"depth": index + 1, **timing.to_dict()}
-                for index, timing in enumerate(self.steps)
-            ],
+            "steps": step_reports,
         }
+        if self.counter_total_delta_samples:
+            report["hot_path_counter_total_delta"] = summarize_counter_samples(
+                self.counter_total_delta_samples
+            )
+        if self.measurement_syncs:
+            report["measurement_syncs"] = dict(self.measurement_syncs)
+        return report
+
+
+@dataclass(frozen=True)
+class PerRouteTop1Selection:
+    """Keep one greedy continuation for each active route.
+
+    This is the matched ordinary-AR baseline: it uses the same frontier batch,
+    physical KV, and model forward as tree/forest construction without global
+    or per-root competition across routes.
+    """
+
+    phase: DecodePhase
+
+    def select(
+        self,
+        candidates: Sequence[PendingCandidate],
+        *,
+        k: int,
+        active_routes: Sequence[RouteState],
+    ) -> list[PendingCandidate]:
+        del k
+        by_parent: dict[int, list[PendingCandidate]] = {}
+        for candidate in candidates:
+            by_parent.setdefault(int(candidate.parent_route_id), []).append(candidate)
+
+        selected: list[PendingCandidate] = []
+        for route in active_routes:
+            route_candidates = by_parent.get(int(route.route_id), [])
+            if not route_candidates:
+                raise ValueError(f"route {int(route.route_id)} produced no AR candidate")
+            selected.extend(global_topk_candidates(route_candidates, num_selected=1))
+        return selected
+
+    def select_indices(
+        self,
+        candidates: PendingCandidateBatch,
+        *,
+        k: int,
+        active_routes: Sequence[RouteState],
+    ) -> torch.Tensor:
+        del k
+        if int(candidates.candidates_per_parent) != 1:
+            raise ValueError("matched AR requires exactly one candidate per parent")
+        if int(candidates.candidate_count) != len(active_routes):
+            raise ValueError(
+                "matched AR candidate count must equal the active route batch size"
+            )
+        return torch.arange(
+            candidates.candidate_count,
+            device=candidates.pending_token_ids.device,
+            dtype=torch.long,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -152,6 +236,84 @@ def timing(samples_ms: Sequence[float]) -> Timing:
         mean_ms=float(statistics.fmean(values)),
         samples_ms=values,
     )
+
+
+def summarize_counter_samples(
+    samples: Sequence[Mapping[str, int]],
+) -> dict[str, dict[str, object]]:
+    keys = sorted({str(key) for sample in samples for key in sample})
+    summary: dict[str, dict[str, object]] = {}
+    for key in keys:
+        values = [int(sample.get(key, 0)) for sample in samples]
+        summary[key] = {
+            "median": float(statistics.median(values)),
+            "mean": float(statistics.fmean(values)),
+            "samples": values,
+        }
+    return summary
+
+
+def subtract_counters(
+    after: Mapping[str, int],
+    before: Mapping[str, int],
+) -> dict[str, int]:
+    keys = {str(key) for key in after} | {str(key) for key in before}
+    return {
+        key: int(after.get(key, 0)) - int(before.get(key, 0))
+        for key in sorted(keys)
+    }
+
+
+def state_hot_path_counters(state: FrontierState) -> dict[str, int]:
+    counter_fn = getattr(state.context.backend.route_pool, "hot_path_counters", None)
+    if not callable(counter_fn):
+        return {}
+    return {
+        str(key): int(value)
+        for key, value in dict(counter_fn()).items()
+    }
+
+
+def step_hot_path_counters(result: Any, state: FrontierState) -> dict[str, int]:
+    decode_output = getattr(result, "decode_output", None)
+    metadata = getattr(decode_output, "metadata", None)
+    if isinstance(metadata, Mapping):
+        counters = metadata.get("hot_path_counters_total")
+        if isinstance(counters, Mapping):
+            return {
+                str(key): int(value)
+                for key, value in counters.items()
+            }
+    return state_hot_path_counters(state)
+
+
+def step_selection_counter_delta(result: Any) -> dict[str, int]:
+    stats = getattr(result, "selection_stats", None)
+    if stats is None:
+        return {}
+    names = (
+        "candidate_count",
+        "selected_count",
+        "host_materialization_batches",
+        "host_materialization_elements",
+        "host_transfer_batches",
+        "host_transfer_elements",
+    )
+    return {
+        f"selection_{name}": int(getattr(stats, name, 0))
+        for name in names
+    }
+
+
+def add_counters(
+    left: Mapping[str, int],
+    right: Mapping[str, int],
+) -> dict[str, int]:
+    keys = {str(key) for key in left} | {str(key) for key in right}
+    return {
+        key: int(left.get(key, 0)) + int(right.get(key, 0))
+        for key in sorted(keys)
+    }
 
 
 def cleanup_cuda() -> None:
@@ -248,7 +410,7 @@ def setup_forest_state(
     return FrontierState(context=context, routes=forest_routes, k=k)
 
 
-def run_tree_step(state: FrontierState) -> None:
+def run_tree_step(state: FrontierState) -> Any:
     result = build_tree_one_depth(
         state.routes,
         k=state.k,
@@ -256,9 +418,10 @@ def run_tree_step(state: FrontierState) -> None:
         model_backend=state.context.backend,
     )
     state.routes = result.next_routes
+    return result
 
 
-def run_forest_step(state: FrontierState) -> None:
+def run_forest_step(state: FrontierState) -> Any:
     result = build_forest_one_depth(
         state.routes,
         k=state.k,
@@ -266,12 +429,29 @@ def run_forest_step(state: FrontierState) -> None:
         model_backend=state.context.backend,
     )
     state.routes = result.next_routes
+    return result
+
+
+def run_matched_ar_step(
+    state: FrontierState,
+    *,
+    phase: DecodePhase,
+) -> Any:
+    result = advance_frontier_one_token(
+        state.routes,
+        k=1,
+        route_store=state.context.store,
+        model_backend=state.context.backend,
+        selection_policy=PerRouteTop1Selection(phase=phase),
+    )
+    state.routes = result.next_routes
+    return result
 
 
 def measure_stepped_component(
     *,
     setup_fn: Callable[[], FrontierState],
-    step_fn: Callable[[FrontierState], None],
+    step_fn: Callable[[FrontierState], Any],
     depth: int,
     warmup: int,
     iters: int,
@@ -284,23 +464,90 @@ def measure_stepped_component(
 
     step_samples: list[list[float]] = [[] for _ in range(depth)]
     total_samples: list[float] = []
+    counter_delta_samples: list[list[dict[str, int]]] = [
+        [] for _ in range(depth)
+    ]
+    counter_cumulative_samples: list[list[dict[str, int]]] = [
+        [] for _ in range(depth)
+    ]
+    counter_total_delta_samples: list[dict[str, int]] = []
     for _ in range(iters):
         state = setup_fn()
+        setup_counters = state_hot_path_counters(state)
         sync_cuda()
         total_start = time.perf_counter()
+        step_results: list[Any] = []
         for step_index in range(depth):
             sync_cuda()
             step_start = time.perf_counter()
-            step_fn(state)
+            result = step_fn(state)
             sync_cuda()
             step_samples[step_index].append(
                 (time.perf_counter() - step_start) * 1000.0
             )
+            step_results.append(result)
         total_samples.append((time.perf_counter() - total_start) * 1000.0)
+
+        # Extract Python counter dictionaries only after the timed region.  The
+        # production backend stores an immutable cumulative snapshot in every
+        # step result, so per-depth evidence does not perturb total latency.
+        step_counter_totals = [
+            step_hot_path_counters(result, state)
+            for result in step_results
+        ]
+        step_selection_deltas = [
+            step_selection_counter_delta(result)
+            for result in step_results
+        ]
+        previous_counters = setup_counters
+        cumulative_selection_counters: dict[str, int] = {}
+        for step_index, counters_after_step in enumerate(step_counter_totals):
+            bridge_delta = subtract_counters(
+                counters_after_step,
+                previous_counters,
+            )
+            cumulative_selection_counters = add_counters(
+                cumulative_selection_counters,
+                step_selection_deltas[step_index],
+            )
+            counter_delta_samples[step_index].append(
+                add_counters(bridge_delta, step_selection_deltas[step_index])
+            )
+            counter_cumulative_samples[step_index].append(
+                add_counters(
+                    subtract_counters(counters_after_step, setup_counters),
+                    cumulative_selection_counters,
+                )
+            )
+            previous_counters = counters_after_step
+        counter_total_delta_samples.append(
+            add_counters(
+                subtract_counters(previous_counters, setup_counters),
+                cumulative_selection_counters,
+            )
+        )
+
+    measured_syncs_per_iteration = 1 + 2 * int(depth)
+    measurement_syncs = {
+        "kind": "benchmark_explicit_cuda_synchronize",
+        "warmup_after_workload_total": int(warmup),
+        "before_timed_region_per_iteration": 1,
+        "inside_total_timing_per_iteration": 2 * int(depth),
+        "inside_each_step_sample": 1,
+        "measured_per_iteration": measured_syncs_per_iteration,
+        "measured_total": int(iters) * measured_syncs_per_iteration,
+        "overall_total": int(warmup) + int(iters) * measured_syncs_per_iteration,
+        "excluded_from_hot_path_counters": True,
+        "counter_summary_extraction_in_timed_region": False,
+    }
 
     return SteppedTiming(
         total=timing(total_samples),
         steps=[timing(samples) for samples in step_samples],
+        counter_delta_samples=counter_delta_samples,
+        counter_cumulative_samples=counter_cumulative_samples,
+        counter_total_delta_samples=counter_total_delta_samples,
+        measurement_syncs=measurement_syncs,
     )
 
 
@@ -472,6 +719,32 @@ def main() -> int:
             )
 
             if not args.skip_tree:
+                matched_tree_ar = measure_stepped_component(
+                    setup_fn=lambda: setup_tree_state(
+                        runner=runner,
+                        prompt_token_ids=prompt_token_ids,
+                        page_size=args.page_size,
+                        prefill_chunk_size=args.prefill_chunk_size,
+                        k=args.k,
+                    ),
+                    step_fn=lambda state: run_matched_ar_step(
+                        state,
+                        phase=DecodePhase.STAGE1,
+                    ),
+                    depth=args.d,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                )
+                report["matched_drafter_ar_tree_workload"] = {
+                    "batch_size": int(args.k),
+                    "decode_steps": int(args.d),
+                    "selection": "independent_per_route_greedy_top1",
+                    "setup_and_prefill_included": False,
+                    **matched_tree_ar.to_dict(),
+                }
+                print("\n=== Matched Drafter AR for tree workload ===")
+                print_stepped("matched_tree_ar", matched_tree_ar)
+
                 tree = measure_stepped_component(
                     setup_fn=lambda: setup_tree_state(
                         runner=runner,
@@ -489,14 +762,51 @@ def main() -> int:
                 report["build_tree"]["mean_over_drafter_ar1"] = (
                     tree.total.mean_ms / drafter_ar.mean_ms
                 )
+                report["build_tree"]["mean_over_matched_drafter_ar"] = (
+                    tree.total.mean_ms / matched_tree_ar.total.mean_ms
+                )
+                report["build_tree"]["matched_drafter_ar_report_key"] = (
+                    "matched_drafter_ar_tree_workload"
+                )
                 print("\n=== Isolated Drafter build tree ===")
                 print_stepped("build_tree", tree)
                 print(
                     f"  mean tree/ar1             "
                     f"{tree.total.mean_ms / drafter_ar.mean_ms:9.3f}x"
                 )
+                print(
+                    f"  mean tree/matched-ar      "
+                    f"{tree.total.mean_ms / matched_tree_ar.total.mean_ms:9.3f}x"
+                )
 
             if not args.skip_forest:
+                matched_forest_ar = measure_stepped_component(
+                    setup_fn=lambda: setup_forest_state(
+                        runner=runner,
+                        prompt_token_ids=prompt_token_ids,
+                        page_size=args.page_size,
+                        prefill_chunk_size=args.prefill_chunk_size,
+                        k=args.k,
+                        d=args.d,
+                    ),
+                    step_fn=lambda state: run_matched_ar_step(
+                        state,
+                        phase=DecodePhase.STAGE2,
+                    ),
+                    depth=args.d,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                )
+                report["matched_drafter_ar_forest_workload"] = {
+                    "batch_size": int(args.k * args.k),
+                    "decode_steps": int(args.d),
+                    "selection": "independent_per_route_greedy_top1",
+                    "setup_and_prefill_included": False,
+                    **matched_forest_ar.to_dict(),
+                }
+                print("\n=== Matched Drafter AR for forest workload ===")
+                print_stepped("matched_forest_ar", matched_forest_ar)
+
                 forest = measure_stepped_component(
                     setup_fn=lambda: setup_forest_state(
                         runner=runner,
@@ -515,11 +825,21 @@ def main() -> int:
                 report["build_forest"]["mean_over_drafter_ar1"] = (
                     forest.total.mean_ms / drafter_ar.mean_ms
                 )
+                report["build_forest"]["mean_over_matched_drafter_ar"] = (
+                    forest.total.mean_ms / matched_forest_ar.total.mean_ms
+                )
+                report["build_forest"]["matched_drafter_ar_report_key"] = (
+                    "matched_drafter_ar_forest_workload"
+                )
                 print("\n=== Isolated Drafter build forest ===")
                 print_stepped("build_forest", forest)
                 print(
                     f"  mean forest/ar1           "
                     f"{forest.total.mean_ms / drafter_ar.mean_ms:9.3f}x"
+                )
+                print(
+                    f"  mean forest/matched-ar    "
+                    f"{forest.total.mean_ms / matched_forest_ar.total.mean_ms:9.3f}x"
                 )
     finally:
         runner = None
