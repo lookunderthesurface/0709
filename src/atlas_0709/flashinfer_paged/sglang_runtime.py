@@ -1052,7 +1052,8 @@ class SGLangFlashInferFrontierModelBackend:
                 dtype=torch.long,
             ),
             next_token_logits=logits,
-            new_node_ids=torch.tensor(new_node_ids, device=input_ids.device, dtype=torch.long),
+            new_node_ids=tuple(int(node_id) for node_id in new_node_ids),
+            new_node_ids_cpu=tuple(int(node_id) for node_id in new_node_ids),
             model_ms=elapsed_ms,
             metadata={
                 "backend": "sglang_flashinfer_paged_decode",

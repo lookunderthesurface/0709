@@ -76,6 +76,36 @@ class PendingCandidate:
 
 
 @dataclass(frozen=True)
+class PendingCandidateBatch:
+    """Device-resident candidate descriptors for one frontier depth."""
+
+    parent_route_ids: torch.Tensor
+    stage1_root_ids: torch.Tensor
+    parent_row_indices: torch.Tensor
+    pending_token_ids: torch.Tensor
+    cumulative_logprobs: torch.Tensor
+    parent_logprobs: torch.Tensor
+    ranks_in_parent: torch.Tensor
+    candidates_per_parent: int
+
+    @property
+    def candidate_count(self) -> int:
+        return int(self.pending_token_ids.numel())
+
+
+@dataclass(frozen=True)
+class FrontierSelectionStats:
+    candidate_count: int = 0
+    selected_count: int = 0
+    host_materialization_batches: int = 0
+    host_materialization_elements: int = 0
+    host_transfer_batches: int = 0
+    host_transfer_elements: int = 0
+    selection_device: str = "cpu"
+    new_node_ids_source: str = "unknown"
+
+
+@dataclass(frozen=True)
 class DraftPrefixState:
     token_ids: torch.Tensor
     prefix_kv_view: PrefixKVView
@@ -87,7 +117,8 @@ class DraftPrefixState:
 class FrontierDecodeOutput:
     route_ids: torch.Tensor
     next_token_logits: torch.Tensor
-    new_node_ids: torch.Tensor
+    new_node_ids: torch.Tensor | Sequence[int]
+    new_node_ids_cpu: tuple[int, ...] | None = None
     attention_ms: float = 0.0
     model_ms: float = 0.0
     kv_append_ms: float = 0.0
@@ -101,6 +132,9 @@ class FrontierStepOutput:
     candidates: list[PendingCandidate]
     selected_candidates: list[PendingCandidate]
     decode_output: FrontierDecodeOutput
+    selection_stats: FrontierSelectionStats = field(
+        default_factory=FrontierSelectionStats
+    )
 
 
 @dataclass(frozen=True)

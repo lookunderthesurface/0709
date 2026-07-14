@@ -247,9 +247,18 @@ def advance_top1_per_route(
     backend: SGLangFlashInferFrontierModelBackend,
 ) -> list[RouteState]:
     decode_output = backend.decode_frontier_one_token(routes)
+    if decode_output.new_node_ids_cpu is not None:
+        new_node_ids = [int(value) for value in decode_output.new_node_ids_cpu]
+    elif isinstance(decode_output.new_node_ids, torch.Tensor):
+        new_node_ids = [
+            int(value)
+            for value in decode_output.new_node_ids.detach().cpu().tolist()
+        ]
+    else:
+        new_node_ids = [int(value) for value in decode_output.new_node_ids]
     materialized = store.mark_routes_materialized(
         list(routes),
-        [int(value) for value in decode_output.new_node_ids.detach().cpu().tolist()],
+        new_node_ids,
         phase=DecodePhase.STAGE1,
     )
     candidates: list[PendingCandidate] = []
