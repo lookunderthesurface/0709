@@ -93,6 +93,15 @@ def test_stepped_counter_samples_exclude_setup_and_track_each_depth(monkeypatch)
     assert result["hot_path_counter_total_delta"][
         "selection_host_transfer_elements"
     ]["samples"] == [24, 24]
+    assert depth1["hot_path_counter_delta"]["total_host_transfer_batches"][
+        "samples"
+    ] == [1, 1]
+    assert result["hot_path_counter_total_delta"][
+        "total_host_transfer_batches"
+    ]["samples"] == [2, 2]
+    assert result["hot_path_counter_total_delta"][
+        "total_host_transfer_elements"
+    ]["samples"] == [24, 24]
 
     # The setup-only counter is present for auditability but its measured delta
     # is zero, proving the snapshot baseline was taken after setup/prefill.

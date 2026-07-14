@@ -316,6 +316,21 @@ def add_counters(
     }
 
 
+def add_total_host_transfer_counters(
+    counters: Mapping[str, int],
+) -> dict[str, int]:
+    result = {str(key): int(value) for key, value in counters.items()}
+    result["total_host_transfer_batches"] = int(
+        result.get("hot_path_host_transfer_batches", 0)
+        + result.get("selection_host_transfer_batches", 0)
+    )
+    result["total_host_transfer_elements"] = int(
+        result.get("hot_path_host_transfer_elements", 0)
+        + result.get("selection_host_transfer_elements", 0)
+    )
+    return result
+
+
 def cleanup_cuda() -> None:
     gc.collect()
     torch.cuda.empty_cache()
@@ -511,19 +526,25 @@ def measure_stepped_component(
                 step_selection_deltas[step_index],
             )
             counter_delta_samples[step_index].append(
-                add_counters(bridge_delta, step_selection_deltas[step_index])
+                add_total_host_transfer_counters(
+                    add_counters(bridge_delta, step_selection_deltas[step_index])
+                )
             )
             counter_cumulative_samples[step_index].append(
-                add_counters(
-                    subtract_counters(counters_after_step, setup_counters),
-                    cumulative_selection_counters,
+                add_total_host_transfer_counters(
+                    add_counters(
+                        subtract_counters(counters_after_step, setup_counters),
+                        cumulative_selection_counters,
+                    )
                 )
             )
             previous_counters = counters_after_step
         counter_total_delta_samples.append(
-            add_counters(
-                subtract_counters(previous_counters, setup_counters),
-                cumulative_selection_counters,
+            add_total_host_transfer_counters(
+                add_counters(
+                    subtract_counters(previous_counters, setup_counters),
+                    cumulative_selection_counters,
+                )
             )
         )
 

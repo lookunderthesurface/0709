@@ -348,6 +348,29 @@ def test_tail_lease_propagates_through_reconcile_retain_commit_and_clear() -> No
     assert bridge.route_tail_page_keys == {}
 
 
+def test_prefix_cpu_metadata_covers_full_partial_and_empty_multi_page_paths() -> None:
+    bridge = make_bridge()
+
+    bridge.set_prefix_slots(torch.arange(40, 48, dtype=torch.long))
+    assert bridge.prefix_slot_count == 8
+    assert bridge.prefix_page_ids == {10, 11}
+    assert bridge.prefix_tail_page_key is None
+    assert bridge.prefix_partial_tail_keys == {}
+
+    bridge.set_prefix_slots(torch.arange(40, 45, dtype=torch.long))
+    partial_key = bridge.prefix_tail_page_key
+    assert bridge.prefix_slot_count == 5
+    assert bridge.prefix_page_ids == {10, 11}
+    assert partial_key is not None
+    assert bridge.prefix_partial_tail_keys == {1: partial_key}
+
+    bridge.set_prefix_slots(torch.empty((0,), dtype=torch.long))
+    assert bridge.prefix_slot_count == 0
+    assert bridge.prefix_page_ids == set()
+    assert bridge.prefix_tail_page_key is None
+    assert bridge.prefix_partial_tail_keys == {}
+
+
 def test_req_row_full_rewrite_counters_record_written_elements() -> None:
     bridge = make_bridge()
     bridge._write_req_token_row(3, torch.tensor([4, 5, 6, 7], dtype=torch.long))

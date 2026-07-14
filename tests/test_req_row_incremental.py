@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
 
+from atlas_0709.flashinfer_paged import flashinfer_backends
+from atlas_0709.flashinfer_paged.flashinfer_backends import (
+    SGLangFlashInferPagedDecodeBackend,
+    SGLangRouteKVMetadata,
+)
 from atlas_0709.flashinfer_paged.sglang_runtime import SGLangRoutePoolBridge
 from atlas_0709.flashinfer_paged.types import PrefixKVView, RouteKVView, RouteState
 
@@ -433,3 +439,73 @@ def test_failed_cow_patch_persists_dirty_range_for_retry() -> None:
     assert counters["req_row_write_calls"] == 2
     assert counters["req_row_append_calls"] == 1
     assert counters["req_row_cow_patch_calls"] == 1
+
+
+def test_decode_backend_forwards_cached_cpu_sequence_metadata(monkeypatch) -> None:
+    class CapturingForwardBatch:
+        def __init__(self, **kwargs) -> None:
+            self.__dict__.update(kwargs)
+
+    class CapturingRunner:
+        def __init__(self) -> None:
+            self.forward_batch = None
+
+        def forward(self, forward_batch):
+            self.forward_batch = forward_batch
+            return SimpleNamespace(next_token_logits=torch.ones((2, 4)))
+
+    runner = CapturingRunner()
+    backend = object.__new__(SGLangFlashInferPagedDecodeBackend)
+    backend.model_runner = runner
+    backend._ForwardBatch = CapturingForwardBatch
+    backend._ForwardMode = SimpleNamespace(DECODE="decode")
+    monkeypatch.setattr(flashinfer_backends, "_validate_1d_long", lambda *_: None)
+    monkeypatch.setattr(
+        flashinfer_backends,
+        "_capture_hidden_mode_null",
+        lambda: "null",
+    )
+    seq_lens_cpu = torch.tensor([5, 6], dtype=torch.long)
+    metadata = SGLangRouteKVMetadata(
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.long),
+        seq_lens=torch.tensor([5, 6], dtype=torch.long),
+        out_cache_loc=torch.tensor([40, 44], dtype=torch.long),
+        positions=torch.tensor([4, 5], dtype=torch.long),
+        seq_lens_sum=11,
+        seq_lens_cpu=seq_lens_cpu,
+    )
+
+    logits = backend.forward_frontier(
+        input_ids=torch.tensor([7, 8], dtype=torch.long),
+        route_kv_metadata=metadata,
+    )
+
+    assert logits.shape == (2, 4)
+    assert runner.forward_batch.seq_lens_sum == 11
+    assert runner.forward_batch.seq_lens_cpu is seq_lens_cpu
+
+    try:
+        backend.forward_frontier(
+            input_ids=torch.tensor([7, 8], dtype=torch.long),
+            route_kv_metadata=replace(
+                metadata,
+                seq_lens_cpu=torch.tensor([[5, 6]], dtype=torch.long),
+            ),
+        )
+    except ValueError as exc:
+        assert "shape [B]" in str(exc)
+    else:
+        raise AssertionError("non-vector seq_lens_cpu was accepted")
+
+    try:
+        backend.forward_frontier(
+            input_ids=torch.tensor([7, 8], dtype=torch.long),
+            route_kv_metadata=replace(
+                metadata,
+                seq_lens_cpu=torch.empty((2,), device="meta", dtype=torch.long),
+            ),
+        )
+    except ValueError as exc:
+        assert "CPU tensor" in str(exc)
+    else:
+        raise AssertionError("non-CPU seq_lens_cpu was accepted")
