@@ -33,8 +33,15 @@ Plain confidence-based dynamic `k,d`, optimal tree shape, asynchronous
 draft/verify, and a generic quality--runtime knob all have close prior work.
 In particular, the next literature comparison must include EAGLE-2, Sequoia,
 OPT-Tree, Fuzzy Speculative Decoding, PEARL, and 2026 Saguaro/Speculative
-Speculative Decoding. Do not claim that 0709 is the first dynamic or
-asynchronous speculative tree.
+Speculative Decoding. Two especially close 2026 Edge--Cloud papers are
+PicoSpec (arXiv:2603.19133), which already presents an asynchronous pipelined
+collaborative SD system, and *Speculation at a Distance*
+(arXiv:2606.25091), which argues that WAN single-request latency gains occupy a
+narrow regime and that multi-tenant capacity may be the stronger distributed
+claim. Do not claim that 0709 is the first dynamic, asynchronous, or
+Edge--Cloud speculative tree. Differentiate it through deadline-aware
+interruptible forest construction, the persistent physical KV lifecycle, and
+measured SLO/capacity tradeoffs.
 
 CUDA Graph, synchronization removal, route-row/page-table cleanup, and cheaper
 tail-page COW remain important **engineering enablers and fairness controls**.
