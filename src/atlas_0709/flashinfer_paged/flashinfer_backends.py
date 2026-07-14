@@ -23,6 +23,9 @@ class SGLangRouteKVMetadata:
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     orig_seq_lens: torch.Tensor | None = None
+    attention_page_size: int = 1
+    token_index_count: int = 0
+    page_index_count: int = 0
 
 
 class FlashInferBackendBase:

@@ -16,6 +16,7 @@ from .builders import (
 )
 from .flashinfer_backends import SGLangFlashInferPagedDecodeBackend, SGLangRouteKVMetadata
 from .kv import KVTreeNode, KVTreeStore
+from .paged_metadata import FlashInferPagedKVMetadata, build_flashinfer_paged_kv_metadata
 from .sglang_runtime import (
     SGLangFlashInferFrontierModelBackend,
     SGLangMemoryPoolBundle,
@@ -46,6 +47,7 @@ __all__ = [
     "DraftPrefixState",
     "FrontierDecodeOutput",
     "FrontierStepOutput",
+    "FlashInferPagedKVMetadata",
     "KVTreeNode",
     "KVTreeStore",
     "PendingCandidate",
@@ -65,6 +67,7 @@ __all__ = [
     "build_forest_one_depth",
     "build_tree_depths",
     "build_tree_one_depth",
+    "build_flashinfer_paged_kv_metadata",
     "create_sglang_model_runner",
     "initialize_forest_routes",
     "initialize_stage1_routes",

@@ -97,6 +97,13 @@ class SGLangRoutePoolBridge:
     owned_page_ids: set[int] = field(default_factory=set)
     cow_pages_copied: int = 0
     cow_tokens_copied: int = 0
+    attention_metadata_builds: int = 0
+    attention_metadata_token_indices: int = 0
+    attention_metadata_page_indices: int = 0
+    req_row_write_calls: int = 0
+    req_row_elements_written: int = 0
+    req_row_full_rewrite_calls: int = 0
+    req_row_full_rewrite_elements: int = 0
 
     @classmethod
     def from_runner(
@@ -295,6 +302,13 @@ class SGLangRoutePoolBridge:
         self.owned_page_ids.clear()
         self.cow_pages_copied = 0
         self.cow_tokens_copied = 0
+        self.attention_metadata_builds = 0
+        self.attention_metadata_token_indices = 0
+        self.attention_metadata_page_indices = 0
+        self.req_row_write_calls = 0
+        self.req_row_elements_written = 0
+        self.req_row_full_rewrite_calls = 0
+        self.req_row_full_rewrite_elements = 0
         clear_req_pool = getattr(self.req_to_token_pool, "clear", None)
         if callable(clear_req_pool):
             clear_req_pool()
@@ -502,12 +516,19 @@ class SGLangRoutePoolBridge:
             positions.append(seq_len - 1)
 
         seq_lens_tensor = torch.tensor(seq_lens, device=self.device, dtype=torch.long)
+        token_index_count = int(sum(seq_lens))
+        self.attention_metadata_builds += 1
+        self.attention_metadata_token_indices += token_index_count
+        self.attention_metadata_page_indices += token_index_count
         metadata = SGLangRouteKVMetadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens_tensor,
             out_cache_loc=output_slot_ids,
             positions=torch.tensor(positions, device=self.device, dtype=torch.long),
             orig_seq_lens=seq_lens_tensor,
+            attention_page_size=1,
+            token_index_count=token_index_count,
+            page_index_count=token_index_count,
         )
         return input_ids, metadata
 
@@ -562,6 +583,10 @@ class SGLangRoutePoolBridge:
 
     def _write_req_token_row(self, req_pool_index: int, slot_path: torch.Tensor) -> None:
         slot_len = int(slot_path.numel())
+        self.req_row_write_calls += 1
+        self.req_row_elements_written += slot_len
+        self.req_row_full_rewrite_calls += 1
+        self.req_row_full_rewrite_elements += slot_len
         capacity = _req_to_token_pool_context_capacity(self.req_to_token_pool)
         if capacity is None:
             capacity = self.max_context_len
@@ -584,6 +609,19 @@ class SGLangRoutePoolBridge:
             return
         except Exception as exc:
             raise RuntimeError("failed to write SGLang req_to_token_pool route row") from exc
+
+    def hot_path_counters(self) -> dict[str, int]:
+        return {
+            "attention_metadata_builds": int(self.attention_metadata_builds),
+            "attention_metadata_token_indices": int(self.attention_metadata_token_indices),
+            "attention_metadata_page_indices": int(self.attention_metadata_page_indices),
+            "cow_pages_copied": int(self.cow_pages_copied),
+            "cow_tokens_copied": int(self.cow_tokens_copied),
+            "req_row_write_calls": int(self.req_row_write_calls),
+            "req_row_elements_written": int(self.req_row_elements_written),
+            "req_row_full_rewrite_calls": int(self.req_row_full_rewrite_calls),
+            "req_row_full_rewrite_elements": int(self.req_row_full_rewrite_elements),
+        }
 
 
 class SGLangFlashInferFrontierModelBackend:
@@ -767,12 +805,18 @@ class SGLangFlashInferFrontierModelBackend:
         attention_backend: object = None,
     ) -> FrontierDecodeOutput:
         start = time.perf_counter()
+        counters_before = self.route_pool.hot_path_counters()
         new_node_ids = self.route_store.reserve_node_ids(len(active_routes))
         input_ids, metadata = self.route_pool.prepare_frontier(active_routes)
         ensure_sglang_runner_runtime_defaults(self.executor.model_runner)
         ensure_sglang_eager_runner(self.executor.model_runner)
         logits = self.executor.forward_frontier(input_ids=input_ids, route_kv_metadata=metadata)
         self.route_pool.register_node_slots(new_node_ids, metadata.out_cache_loc)
+        counters_after = self.route_pool.hot_path_counters()
+        counter_delta = {
+            key: int(counters_after[key] - counters_before.get(key, 0))
+            for key in counters_after
+        }
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return FrontierDecodeOutput(
             route_ids=torch.tensor(
@@ -792,6 +836,11 @@ class SGLangFlashInferFrontierModelBackend:
                 "branch_safe_page_size": True,
                 "cow_pages_copied_total": int(self.route_pool.cow_pages_copied),
                 "cow_tokens_copied_total": int(self.route_pool.cow_tokens_copied),
+                "attention_metadata_page_size": int(metadata.attention_page_size),
+                "attention_metadata_token_indices_step": int(metadata.token_index_count),
+                "attention_metadata_page_indices_step": int(metadata.page_index_count),
+                "hot_path_counter_delta": counter_delta,
+                "hot_path_counters_total": counters_after,
                 "attention_backend": str(attention_backend),
                 **self.executor.runtime_metadata(cascade_level=0, verify_backend="none"),
             },

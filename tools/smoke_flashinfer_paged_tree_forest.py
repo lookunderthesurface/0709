@@ -380,6 +380,7 @@ def main() -> int:
                 "prefix_slot_count": int(prefill.prefix_slot_ids.numel()),
                 "max_running_requests": args.max_running_requests,
                 "max_total_tokens": args.max_total_tokens,
+                "hot_path_counters": frontier_backend.route_pool.hot_path_counters(),
             },
         }
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))

@@ -38,6 +38,12 @@ class FakeAllocator:
 
 
 class FakeReqPool:
+    def __init__(self) -> None:
+        self.req_to_token = torch.zeros((8, 128), dtype=torch.long)
+
+    def write(self, indices, values: torch.Tensor) -> None:
+        self.req_to_token[indices] = values
+
     def clear(self) -> None:
         pass
 
@@ -91,3 +97,15 @@ def test_batch1_ar_does_not_copy_a_partial_tail() -> None:
 
     assert copied[0] is partial_page
     assert bridge.cow_pages_copied == 0
+
+
+def test_req_row_full_rewrite_counters_record_written_elements() -> None:
+    bridge = make_bridge()
+    bridge._write_req_token_row(3, torch.tensor([4, 5, 6, 7], dtype=torch.long))
+    bridge._write_req_token_row(3, torch.tensor([4, 5, 6, 7, 8], dtype=torch.long))
+
+    counters = bridge.hot_path_counters()
+    assert counters["req_row_write_calls"] == 2
+    assert counters["req_row_elements_written"] == 9
+    assert counters["req_row_full_rewrite_calls"] == 2
+    assert counters["req_row_full_rewrite_elements"] == 9
