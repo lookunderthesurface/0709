@@ -1487,7 +1487,9 @@ decision.
 Quality attribution requires two aligned runs, `target_best` and
 `first_route`, with identical sample indices/content, models, token budget,
 Drafter sampling configuration, and generation seeds. Disable both fallback
-thresholds when isolating route selection. Then run:
+thresholds when isolating route selection. New predictions record exact prompt-
+token hashes, and the comparator also checks backend/execution mode and paired
+generation settings rather than accepting equal prompt lengths alone. Then run:
 
 ```bash
 python tools/compare_gsm8k_target_intervention.py \

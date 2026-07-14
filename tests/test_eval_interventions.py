@@ -8,6 +8,7 @@ from atlas_0709.eval_interventions import (
     paired_target_quality,
     summarize_generation_interventions,
 )
+from tools.compare_gsm8k_target_intervention import _validate_alignment
 
 
 def _score(
@@ -236,3 +237,49 @@ def test_mcnemar_exact_p_value() -> None:
     assert math.isclose(mcnemar_exact_p_value(1, 1), 1.0)
     full_gsm8k = mcnemar_exact_p_value(700, 619)
     assert full_gsm8k is not None and 0.0 <= full_gsm8k <= 1.0
+
+
+def test_paired_alignment_requires_matching_prompt_token_hashes() -> None:
+    base = {
+        "index": 0,
+        "backend": "atlas_serial",
+        "model": "draft",
+        "question": "q",
+        "gold": "1",
+        "prompt_tokens": 10,
+    }
+    try:
+        _validate_alignment(
+            [{**base, "prompt_token_sha256": "a"}],
+            [{**base, "prompt_token_sha256": "b"}],
+            {},
+            {},
+        )
+    except ValueError as exc:
+        assert "different prompt token IDs" in str(exc)
+    else:
+        raise AssertionError("different prompt token IDs should invalidate a pair")
+
+
+def test_paired_alignment_requires_fallback_disabled() -> None:
+    row = {
+        "index": 0,
+        "backend": "atlas_serial",
+        "model": "draft",
+        "question": "q",
+        "gold": "1",
+        "prompt_tokens": 10,
+        "prompt_token_sha256": "same",
+    }
+    best_summary = {
+        "settings": {"fallback_threshold": -0.5, "first_token_threshold": None}
+    }
+    first_summary = {
+        "settings": {"fallback_threshold": None, "first_token_threshold": None}
+    }
+    try:
+        _validate_alignment([row], [row], best_summary, first_summary)
+    except ValueError as exc:
+        assert "requires fallback disabled" in str(exc)
+    else:
+        raise AssertionError("enabled fallback should invalidate route-selection attribution")

@@ -365,6 +365,13 @@ def main() -> int:
                 atlas_repeat_exact = all(
                     run == atlas_runs[0] for run in atlas_runs[1:]
                 )
+                forest_trajectories = [
+                    [int(round_trace["forest_depth"]) for round_trace in trace]
+                    for trace in trace_runs
+                ]
+                distinct_forest_trajectories = {
+                    tuple(trajectory) for trajectory in forest_trajectories
+                }
                 depth_exact = all(paired_exact) and atlas_repeat_exact
                 all_exact = all_exact and depth_exact
                 depth_reports.append(
@@ -376,6 +383,14 @@ def main() -> int:
                         "exact_match_by_repeat": paired_exact,
                         "atlas_repeat_exact": atlas_repeat_exact,
                         "atlas_token_hashes": [token_hash(run) for run in atlas_runs],
+                        "observed_forest_depth_trajectories": forest_trajectories,
+                        "distinct_observed_forest_trajectory_count": len(
+                            distinct_forest_trajectories
+                        ),
+                        "different_live_schedules_observed": (
+                            forest_depth is None
+                            and len(distinct_forest_trajectories) > 1
+                        ),
                         "first_mismatch_by_repeat": [
                             first_mismatch(ar_runs[index], atlas_runs[index])
                             for index in range(args.repeats)

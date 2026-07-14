@@ -698,7 +698,9 @@ paired final-answer report separately records
 `helped` (`target_best` correct, `first_route` wrong), `hurt`, net correct gain,
 response changes, and an exact two-sided McNemar p-value. Once the first output
 token differs, later round traces no longer have a one-to-one causal alignment;
-the paired final GSM8K answer is the causal unit.
+the paired final GSM8K answer is the causal unit. The comparator rejects a pair
+when exact prompt-token hashes, backend/execution mode, generation settings, or
+seeds differ, and it requires both fallback thresholds to be disabled.
 
 ## Validation
 
@@ -739,7 +741,10 @@ token-by-token greedy path. The diagnostic compares exact token IDs against
 integer forest depths can still be checked independently to localize a failure.
 It also enables per-round coordinator/Drafter/Target prefix, physical slot-path,
 and request-row assertions. The production default remains Target best-path
-selection with wall-clock-controlled forest completion.
+selection with wall-clock-controlled forest completion. The JSON also reports
+the observed forest-depth trajectory and how many distinct live trajectories
+occurred; identical outputs from two identical trajectories alone are replay
+evidence, not evidence that different scheduling boundaries were exercised.
 
 Real Drafter route-KV alignment check with normal 16-token pages:
 

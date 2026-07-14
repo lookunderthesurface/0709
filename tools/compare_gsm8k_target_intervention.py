@@ -126,12 +126,35 @@ def _validate_alignment(
     row_seed_checked = 0
     row_seed_partially_unavailable = 0
     row_seed_unavailable = 0
+    prompt_hash_checked = 0
+    prompt_hash_partially_unavailable = 0
+    prompt_hash_unavailable = 0
+    execution_mode_checked = 0
     for index in sorted(best_by_index):
         best = best_by_index[index]
         first = first_by_index[index]
-        for key in ("question", "gold", "model", "prompt_tokens"):
+        for key in ("question", "gold", "model", "backend", "prompt_tokens"):
             if best.get(key) != first.get(key):
                 raise ValueError(f"sample {index} differs in {key}")
+        best_prompt_hash = best.get("prompt_token_sha256")
+        first_prompt_hash = first.get("prompt_token_sha256")
+        if best_prompt_hash is not None and first_prompt_hash is not None:
+            prompt_hash_checked += 1
+            if best_prompt_hash != first_prompt_hash:
+                raise ValueError(f"sample {index} uses different prompt token IDs")
+        elif best_prompt_hash is not None or first_prompt_hash is not None:
+            prompt_hash_partially_unavailable += 1
+        else:
+            prompt_hash_unavailable += 1
+        best_metadata = best.get("metadata")
+        first_metadata = first.get("metadata")
+        if isinstance(best_metadata, Mapping) and isinstance(first_metadata, Mapping):
+            best_mode = best_metadata.get("execution_mode")
+            first_mode = first_metadata.get("execution_mode")
+            if best_mode is not None and first_mode is not None:
+                execution_mode_checked += 1
+                if best_mode != first_mode:
+                    raise ValueError(f"sample {index} uses different execution modes")
         best_target_model = _target_model(best)
         first_target_model = _target_model(first)
         if (
@@ -159,13 +182,36 @@ def _validate_alignment(
         "num_fewshot",
         "max_new_tokens",
         "strict_marker",
+        "system_prompt",
+        "context_length",
+        "dtype",
+        "page_size",
+        "target_model",
         "k",
         "d",
         "drafter_do_sample",
         "drafter_temperature",
+        "path_score_weights",
+        "path_weight_alpha",
+        "fallback_threshold",
+        "first_token_threshold",
+        "fallback_ar_tokens",
     )
     best_settings = best_summary.get("settings", {})
     first_settings = first_summary.get("settings", {})
+    fallback_disabled_status = "unavailable_legacy"
+    if isinstance(best_settings, Mapping) and isinstance(first_settings, Mapping):
+        threshold_names = ("fallback_threshold", "first_token_threshold")
+        if all(name in best_settings and name in first_settings for name in threshold_names):
+            for name in threshold_names:
+                if best_settings[name] is not None or first_settings[name] is not None:
+                    raise ValueError(
+                        "paired route-selection attribution requires fallback disabled: "
+                        f"{name} target_best={best_settings[name]!r}, "
+                        f"first_route={first_settings[name]!r}"
+                    )
+            fallback_disabled_status = "matched_disabled"
+
     matched_settings: list[str] = []
     if isinstance(best_settings, Mapping) and isinstance(first_settings, Mapping):
         for name in comparable_setting_names:
@@ -199,6 +245,19 @@ def _validate_alignment(
         "sample_content_matched": True,
         "sample_count": len(best_indices),
         "sample_index_sha256": digest,
+        "prompt_token_hash_checked": prompt_hash_checked,
+        "prompt_token_hash_partially_unavailable": prompt_hash_partially_unavailable,
+        "prompt_token_hash_unavailable": prompt_hash_unavailable,
+        "prompt_token_hash_status": (
+            "matched"
+            if prompt_hash_checked == len(best_indices)
+            else "partially_unavailable"
+            if prompt_hash_checked or prompt_hash_partially_unavailable
+            else "unavailable_legacy"
+        ),
+        "backend_matched": True,
+        "execution_mode_checked": execution_mode_checked,
+        "fallback_disabled_status": fallback_disabled_status,
         "per_sample_seed_checked": row_seed_checked,
         "per_sample_seed_partially_unavailable": row_seed_partially_unavailable,
         "per_sample_seed_unavailable": row_seed_unavailable,

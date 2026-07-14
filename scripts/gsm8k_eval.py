@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -79,6 +80,11 @@ def append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(dict(row), ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
+
+
+def token_ids_sha256(token_ids: Sequence[int]) -> str:
+    payload = ",".join(str(int(token_id)) for token_id in token_ids).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def normalize_number(value: str | None) -> str | None:
@@ -483,6 +489,7 @@ def main() -> int:
                        "question": example["question"], "gold": gold, "prediction": prediction,
                        "correct": prediction == gold, "response": text,
                        "prompt_tokens": len(prompt_ids), "generated_tokens": len(generated_ids),
+                       "prompt_token_sha256": token_ids_sha256(prompt_ids),
                        "generation_seed": request_seed,
                        "elapsed_s": elapsed,
                        "tokens_per_second": len(generated_ids) / elapsed if elapsed else None,
@@ -583,7 +590,14 @@ def main() -> int:
                    "excludes_target_prompt_prefill": True,
                } if serial_metrics else None),
                "settings": {"protocol": args.protocol, "num_fewshot": 8 if args.protocol == "llama-8shot" else 0,
-                            "max_new_tokens": args.max_new_tokens, "strict_marker": args.strict_marker,
+                             "max_new_tokens": args.max_new_tokens, "strict_marker": args.strict_marker,
+                             "system_prompt": args.system_prompt,
+                             "context_length": args.context_length,
+                             "dtype": args.dtype,
+                             "page_size": args.page_size,
+                             "target_model": (
+                                 args.target_model if args.backend == "atlas_serial" else None
+                             ),
                              "k": args.k if args.backend.startswith("atlas") else None,
                              "d": args.d if args.backend.startswith("atlas") else None,
                              "fixed_forest_depth": (
