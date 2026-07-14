@@ -96,22 +96,24 @@ partial forests.
 ### Evidence already obtained
 
 These H800 results are preliminary evidence and hypothesis generators, not
-publication claims:
+publication claims. The current primary AR comparison is the direct eager
+SGLang baseline; the older ATLAS-control-path matched AR remains a diagnostic:
 
 ```text
 k=3, d=4, prefix=8192, FP16, FlashInfer 0.6.12
 
-matched batch-3 AR x4:       26.967 ms mean
-0709 Stage-1 tree:           27.873 ms mean   (+3.36%)
-matched batch-9 AR x4:       30.412 ms mean
-0709 Stage-2 forest:         32.385 ms mean   (+6.49%)
+native eager batch-3 AR x4:  25.096 ms mean
+0709 Stage-1 tree:           28.978 ms mean   (+15.47%, paired)
+native eager batch-9 AR x4:  26.806 ms mean
+0709 Stage-2 forest:         31.686 ms mean   (+18.22%, paired)
 Target masked tree verify:   24.224 ms
 Target FI AR1 / AR2:         18.402 / 34.734 ms
 Target linear verify:        28.484 ms
 ```
 
 Thus the measured same-H800 `T_verify` is below the full four-depth
-`T_forest`; before adding RPC overhead the margin is about 8.16 ms. This only
+`T_forest`; before adding RPC overhead the decode-ready margin is about 7.46
+ms. This only
 predicts full hiding for total added RTT/overhead within that margin on this
 proxy. A weak real Edge may provide a larger forest window.
 
@@ -203,8 +205,9 @@ latency, and equal compute instead of presenting only one operating point.
 
 ## Drafter Hot-Path Completion (2026-07-14)
 
-The four requested Drafter engineering items are implemented, pushed, and
-validated on Herta at `4cace1c57a700403874b0884fbc2ff5528e618df`.
+The four requested Drafter engineering items and the fair native batch-AR
+baseline are implemented, pushed, and validated on Herta at
+`3caf628149c67fdf349532d1e0ac0dae41911087`.
 Do not restart these changes from scratch. The relevant commit sequence is:
 
 ```text
@@ -219,6 +222,11 @@ c3cb670  Add matched Drafter hot-path benchmarks
 dab52c3  Remove Drafter bridge scalar synchronizations
 f71275d  Make Drafter transfer accounting explicit
 4cace1c  Fix Target scoring test fixture
+434e088  Add paired native SGLang batch AR baseline
+654cfe9  Keep benchmark tests dependency free
+24d0b83  Match native AR req table dtype
+bd25f83  Aggregate paired speed ratios geometrically
+3caf628  Clarify native AR comparison scope
 ```
 
 ### What is now true
@@ -270,7 +278,7 @@ candidate D2H batch per decode depth in the standard production path.
 ### Correctness and regression evidence
 
 Herta ran all test functions in the seven current test modules with the atlas
-environment: **42/42 passed**. `compileall` and `git diff --check` passed.
+environment: **46/46 passed**. `compileall` and `git diff --check` passed.
 Ruff is not installed in that environment and was not installed because this
 task forbids adding dependencies.
 
@@ -379,6 +387,90 @@ The old single-process `981f5c2` harness reported tree 28.290 ms and forest
 multi-process repetition. Treat it only as a noisy historical before/after,
 not a causal performance claim.
 
+### Primary native eager batch-AR baseline
+
+The old `matched_drafter_ar_*` controls still execute ATLAS log-softmax/top-k,
+packed candidate D2H, Python route/node materialization, and route-row
+lifecycle. They isolate policy differences inside the ATLAS control plane but
+are **not** a native AR speed baseline. Keep them as sequential diagnostics;
+do not use their 1.048x/1.065x ratios as the paper-facing AR comparison.
+
+The primary baseline at `3caf628` is
+`native_eager_sglang_batch_ar_page16`:
+
+- same initialized SGLang 0.5.14 ModelRunner, weights, FP16, FlashInfer
+  page-size-16 path, eager execution, allocator, prefix, batch, depth,
+  sequence lengths, initial pending tokens, physical KV, and metadata counts;
+- tree starts from the same `P` frontier with `B=3`; forest starts from the
+  actual completed Stage-1 state at `P+d` with `B=9`;
+- both arms exclude model load, prefill, logical frontier construction,
+  initial req-row initialization, and initial partial-tail COW;
+- native timed work is decode allocation, one batched req-row scatter,
+  page-table construction, ModelRunner forward/KV write, and GPU argmax; it
+  has no RouteState/KVTree/candidate materialization and keeps the next input
+  on GPU;
+- ATLAS still constructs frontier input ids from Python routes and performs
+  subsequent branch/COW/top-k/materialization inside timing. Therefore the
+  result is a decode-critical-path comparison including each algorithm's
+  control plane, not a pure model-kernel comparison;
+- one CUDA synchronization occurs before the four dependent steps and one at
+  completion. There are no benchmark-injected barriers between depths;
+- fresh setups are interleaved in ABBA blocks. Each process has 3 warmups and
+  10 measured samples per arm; seeds 0, 1, and 2 were run as three independent
+  processes. Ratios are paired within each ABBA block and aggregated in log
+  space.
+
+Across 30 samples per arm and 15 ABBA blocks:
+
+```text
+workload                         mean ms   median ms   paired ATLAS/native
+native eager batch-3 AR x4         25.096      25.082       1.000x
+decode-ready Stage-1 tree x4       28.978      28.992       1.155x
+native eager batch-9 AR x4         26.806      26.674       1.000x
+decode-ready Stage-2 forest x4     31.686      31.690       1.182x
+```
+
+The paired mean deltas are 3.882 ms for tree and 4.880 ms for forest. The
+independent-process ratios were:
+
+```text
+run       tree/native    forest/native
+1             1.1516           1.1746
+2             1.1522           1.1839
+3             1.1603           1.1882
+```
+
+With only three independent processes, process-level t intervals are wide and
+must not be over-interpreted: tree `[1.1427, 1.1668]`, forest
+`[1.1651, 1.1996]`. The raw ABBA blocks, process values, and aggregation are in
+the summary file.
+
+Correctness/audit evidence:
+
+```text
+real tree native vs matched AR, two depths:    max abs diff 0, top-1 100%
+real forest native vs matched AR, two depths:  max abs diff 0, top-1 100%
+native host transfers in every formal sample:  0 batches / 0 elements
+native GPU argmax calls per formal sample:      4
+
+tree metadata totals:    native=ATLAS=98,334 token / 6,156 page indices
+forest metadata totals:  native=ATLAS=295,146 token / 18,468 page indices
+```
+
+Artifacts:
+
+```text
+/home/hwc/workspace/0701/0709_outputs/native_ar_alignment_bd25f83.json
+/home/hwc/workspace/0701/0709_outputs/native_ar_baseline_3caf628/run1.json
+/home/hwc/workspace/0701/0709_outputs/native_ar_baseline_3caf628/run2.json
+/home/hwc/workspace/0701/0709_outputs/native_ar_baseline_3caf628/run3.json
+/home/hwc/workspace/0701/0709_outputs/native_ar_baseline_3caf628/summary.json
+```
+
+This is a strong low-level eager GPU-resident AR baseline, not a complete
+SGLang server/scheduler/radix-cache/CUDA-Graph benchmark. A later full-server
+baseline must be reported separately rather than conflated with this result.
+
 ### Reproducible Herta commands and operational notes
 
 For every command, keep writes in `/home/hwc/workspace/0701`. Herta Git needs
@@ -422,8 +514,32 @@ python "$PROJECT_ROOT/benchmarks/bench_atlas_0709_isolated_components.py" \
   --k 3 --d 4 --prefix-len 8192 --page-size 16 --dtype float16 \
   --prefill-chunk-size 8192 --mem-fraction-static 0.65 \
   --max-running-requests 256 --max-total-tokens 65536 \
-  --warmup 1 --iters 3 --skip-verify \
+  --warmup 1 --iters 3 --skip-native-batch-ar --skip-verify \
   --json-out /home/hwc/workspace/0701/0709_outputs/matched_4cace1c/run1.json
+```
+
+The primary native baseline command uses an even iteration count so every
+sample belongs to a complete ABBA block. Repeat it in fresh processes with
+`--pair-order-seed 0`, `1`, and `2`, changing only the output filename:
+
+```bash
+PROJECT_ROOT=/home/hwc/workspace/0701/0709
+cd "$PROJECT_ROOT"
+source /home/hwc/miniconda3/etc/profile.d/conda.sh
+conda activate atlas
+export PYTHONPATH="$PROJECT_ROOT/src"
+export SGLANG_DEBUG_MEMORY_POOL=0
+
+python "$PROJECT_ROOT/benchmarks/bench_atlas_0709_isolated_components.py" \
+  --drafter-model /home/hwc/models/Llama-3.2-1B-Instruct \
+  --target-model /home/hwc/models/Meta-Llama-3.1-8B-Instruct \
+  --k 3 --d 4 --prefix-len 8192 --page-size 16 --dtype float16 \
+  --prefill-chunk-size 8192 --context-length 8200 \
+  --mem-fraction-static 0.75 --max-running-requests 256 \
+  --max-total-tokens 65536 --warmup 3 --iters 10 \
+  --pair-order-seed 0 --skip-verify \
+  --json-out \
+    /home/hwc/workspace/0701/0709_outputs/native_ar_baseline_3caf628/run1.json
 ```
 
 Remaining engineering caveats: CUDA Graph is still intentionally disabled;
