@@ -69,6 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
             "times. Disabled by default because the synchronization changes production timing."
         ),
     )
+    parser.add_argument(
+        "--route-selection-policy",
+        choices=["target_best", "first_route"],
+        default="target_best",
+        help=(
+            "Route decision policy. first_route is a correctness diagnostic that "
+            "always commits the first payload route and requires fallback thresholds "
+            "to be omitted."
+        ),
+    )
     return parser
 
 
@@ -98,6 +108,7 @@ def main() -> int:
         first_token_threshold=args.first_token_threshold,
         fallback_ar_tokens=args.fallback_ar_tokens,
         profile_fallback_ar=args.profile_fallback_ar,
+        route_selection_policy=args.route_selection_policy,
     )
     serve_target(TargetServerApp(backend), host=args.host, port=args.port)
     return 0

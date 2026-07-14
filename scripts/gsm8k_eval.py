@@ -239,6 +239,7 @@ def create_atlas(args: argparse.Namespace, *, serial: bool = False):
                 fallback_threshold=args.fallback_threshold,
                 first_token_threshold=args.first_token_threshold,
                 fallback_ar_tokens=args.fallback_ar_tokens,
+                route_selection_policy=args.route_selection_policy,
             )
         )
     else:
@@ -255,8 +256,15 @@ def create_atlas(args: argparse.Namespace, *, serial: bool = False):
 
     def generate(prompt_ids: Sequence[int], max_new_tokens: int | None = None):
         generator = atlas_generator_class(
-            config=DistributedAtlasConfig(k=args.k, d=args.d, max_new_tokens=max_new_tokens or args.max_new_tokens,
-                                          eos_token_id=eos, fallback_ar_tokens=args.fallback_ar_tokens),
+            config=DistributedAtlasConfig(
+                k=args.k,
+                d=args.d,
+                max_new_tokens=max_new_tokens or args.max_new_tokens,
+                eos_token_id=eos,
+                fallback_ar_tokens=args.fallback_ar_tokens,
+                fixed_forest_depth=args.fixed_forest_depth,
+                validate_state_alignment=args.validate_state_alignment,
+            ),
             runner=runner, page_size=args.page_size, prefill_chunk_size=args.prefill_chunk_size,
             target_client=target, tokenizer=None,
         )
@@ -303,6 +311,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strict-marker", action="store_true", help="Count answers without #### as extraction failures")
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--d", type=int, default=4)
+    parser.add_argument(
+        "--fixed-forest-depth",
+        type=int,
+        default=None,
+        help=(
+            "For async correctness/replay runs, build exactly this many forest "
+            "depths per round. Ignored by atlas_serial."
+        ),
+    )
+    parser.add_argument(
+        "--validate-state-alignment",
+        action="store_true",
+        help="Assert cross-model prefix invariants after every active ATLAS handoff.",
+    )
     parser.add_argument("--fallback-ar-tokens", type=int, default=4)
     parser.add_argument("--path-score-weights", default="0.45,0.30,0.17,0.08")
     parser.add_argument(
@@ -322,6 +344,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--target-workspace-mb", type=int, default=128)
     parser.add_argument("--use-packed-custom-mask", action="store_true")
+    parser.add_argument(
+        "--route-selection-policy",
+        choices=["target_best", "first_route"],
+        default="target_best",
+        help=(
+            "Target route policy for atlas_serial. For remote atlas runs this is "
+            "configured on the Target server and recorded from /health."
+        ),
+    )
     parser.add_argument("--target-timeout", type=float, default=600.0)
     return parser
 
@@ -471,8 +502,11 @@ def main() -> int:
                } if serial_metrics else None),
                "settings": {"protocol": args.protocol, "num_fewshot": 8 if args.protocol == "llama-8shot" else 0,
                             "max_new_tokens": args.max_new_tokens, "strict_marker": args.strict_marker,
-                            "k": args.k if args.backend.startswith("atlas") else None,
-                            "d": args.d if args.backend.startswith("atlas") else None,
+                             "k": args.k if args.backend.startswith("atlas") else None,
+                             "d": args.d if args.backend.startswith("atlas") else None,
+                             "fixed_forest_depth": (
+                                 args.fixed_forest_depth if args.backend == "atlas" else None
+                             ),
                             "path_score_weights": (
                                 args.path_score_weights if args.backend.startswith("atlas") else None
                             ),
@@ -482,12 +516,15 @@ def main() -> int:
                             "fallback_threshold": (
                                 args.fallback_threshold if args.backend.startswith("atlas") else None
                             ),
-                            "first_token_threshold": (
-                                args.first_token_threshold if args.backend.startswith("atlas") else None
-                            ),
-                            "fallback_ar_tokens": (
-                                args.fallback_ar_tokens if args.backend.startswith("atlas") else None
-                            )}}
+                             "first_token_threshold": (
+                                 args.first_token_threshold if args.backend.startswith("atlas") else None
+                             ),
+                             "fallback_ar_tokens": (
+                                 args.fallback_ar_tokens if args.backend.startswith("atlas") else None
+                             ),
+                             "route_selection_policy": (
+                                 args.route_selection_policy if args.backend.startswith("atlas") else None
+                             )}}
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
     return 0

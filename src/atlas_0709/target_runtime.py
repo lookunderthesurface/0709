@@ -54,6 +54,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         first_token_threshold: float | None = None,
         fallback_ar_tokens: int = 4,
         profile_fallback_ar: bool = False,
+        route_selection_policy: str = "target_best",
     ) -> None:
         config.validate()
         self.model_path = model_path
@@ -67,8 +68,19 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         )
         self.fallback_ar_tokens = int(fallback_ar_tokens)
         self.profile_fallback_ar = bool(profile_fallback_ar)
+        self.route_selection_policy = self._validate_route_selection_policy(
+            route_selection_policy
+        )
         if self.fallback_ar_tokens <= 0:
             raise ValueError("fallback_ar_tokens must be positive")
+        if self.route_selection_policy == "first_route" and (
+            self.fallback_threshold is not None
+            or self.first_token_threshold is not None
+        ):
+            raise ValueError(
+                "first_route is a strict diagnostic policy and requires fallback "
+                "thresholds to be disabled"
+            )
         self.dtype = dtype_from_name(config.dtype)
         self.tokenizer, self.model = load_model(
             model_path,
@@ -128,6 +140,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         prefix_token_ids: Sequence[int],
         routes: Sequence[VerifyRoutePayload],
         fallback_max_tokens: int | None = None,
+        selected_path_max_tokens: int | None = None,
         eos_token_id: int | None = None,
     ) -> TargetVerifyResult:
         prefix = tuple(int(token_id) for token_id in prefix_token_ids)
@@ -140,6 +153,14 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             )
         if not routes:
             raise ValueError("verify requires at least one route")
+        if len(routes) != int(self.config.k):
+            raise ValueError(
+                "verify route count does not match configured k: "
+                f"routes={len(routes)}, k={int(self.config.k)}"
+            )
+        route_ids = [int(route.route_id) for route in routes]
+        if len(set(route_ids)) != len(route_ids):
+            raise ValueError("verify route ids must be unique")
 
         paths = [tuple(int(token_id) for token_id in route.token_ids) for route in routes]
         path_lengths = {len(path) for path in paths}
@@ -148,6 +169,11 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         depth = next(iter(path_lengths))
         if depth <= 0:
             raise ValueError("verify routes must contain at least one token")
+        if int(depth) != int(self.config.d):
+            raise ValueError(
+                "verify route depth does not match configured d: "
+                f"depth={int(depth)}, d={int(self.config.d)}"
+            )
 
         tree, route_to_node_paths = build_deduplicated_tree_spec_from_paths(
             paths=paths,
@@ -174,7 +200,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             verify_logits=logits,
             route_to_node_paths=route_to_node_paths,
         )
-        selected = max(
+        best_scored = max(
             scores,
             key=lambda item: (
                 self._selection_score(item),
@@ -182,6 +208,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
                 -item.route_id,
             ),
         )
+        selected = self._select_route(scores)
         fallback_reason = self._fallback_reason(selected)
         prefix_len_before = len(self.prefix_token_ids)
         common_metadata = {
@@ -223,12 +250,12 @@ class DirectFlashInferMaskedTreeVerifyBackend:
                     "fallback_triggered": True,
                     "fallback_reason": fallback_reason,
                     "fallback_token_count": int(len(generated)),
-                    "best_route_id": int(selected.route_id),
-                    "best_selection_score": float(self._selection_score(selected)),
+                    "best_route_id": int(best_scored.route_id),
+                    "best_selection_score": float(self._selection_score(best_scored)),
                     "best_first_token_logprob": (
                         None
-                        if selected.first_token_logprob is None
-                        else float(selected.first_token_logprob)
+                        if best_scored.first_token_logprob is None
+                        else float(best_scored.first_token_logprob)
                     ),
                     "fallback_ar_profile": self._last_fallback_ar_profile,
                 },
@@ -236,9 +263,15 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         selected_index = next(
             index for index, route in enumerate(routes) if int(route.route_id) == int(selected.route_id)
         )
-        self._commit_selected_path(
+        committed_path, committed_node_ids = self._truncate_selected_path(
             token_ids=paths[selected_index],
             node_ids=route_to_node_paths[selected_index],
+            max_tokens=selected_path_max_tokens,
+            eos_token_id=eos_token_id,
+        )
+        self._commit_selected_path(
+            token_ids=committed_path,
+            node_ids=committed_node_ids,
             verify_logits=logits,
         )
         return TargetVerifyResult(
@@ -250,13 +283,17 @@ class DirectFlashInferMaskedTreeVerifyBackend:
                 "target_kv_commit": "selected_tree_path_in_place",
                 "target_reprefill_after_verify": False,
                 "fallback_triggered": False,
-                "best_route_id": int(selected.route_id),
-                "best_selection_score": float(self._selection_score(selected)),
+                "best_route_id": int(best_scored.route_id),
+                "best_selection_score": float(self._selection_score(best_scored)),
                 "best_first_token_logprob": (
                     None
-                    if selected.first_token_logprob is None
-                    else float(selected.first_token_logprob)
+                    if best_scored.first_token_logprob is None
+                    else float(best_scored.first_token_logprob)
                 ),
+                "selected_route_id": int(selected.route_id),
+                "selected_selection_score": float(self._selection_score(selected)),
+                "selected_path_committed_tokens": int(len(committed_path)),
+                "selected_path_was_truncated": bool(len(committed_path) != len(paths[selected_index])),
             },
         )
 
@@ -264,6 +301,11 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         return {
             "backend": "direct_flashinfer_full_llama_masked_verify",
             "model": self.model_path,
+            "model_vocab_size": int(self.model.config.vocab_size),
+            "tokenizer_vocab_size": int(len(self.tokenizer)),
+            "tokenizer_bos_token_id": self.tokenizer.bos_token_id,
+            "tokenizer_eos_token_id": self.tokenizer.eos_token_id,
+            "tokenizer_pad_token_id": self.tokenizer.pad_token_id,
             "paged_kv": True,
             "custom_mask": True,
             "packed_custom_mask": self.config.use_packed_custom_mask,
@@ -278,6 +320,7 @@ class DirectFlashInferMaskedTreeVerifyBackend:
             "persistent_target_paged_kv": True,
             "deduplicated_tree_nodes": True,
             "selection_policy": self._selection_policy_name(),
+            "route_selection_policy": self.route_selection_policy,
             "score_weights": (
                 None if self.score_weights is None else [float(value) for value in self.score_weights]
             ),
@@ -315,9 +358,61 @@ class DirectFlashInferMaskedTreeVerifyBackend:
         return self.score_weights
 
     def _selection_policy_name(self) -> str:
+        if self.route_selection_policy == "first_route":
+            return "diagnostic_first_payload_route"
         if self.score_weights is None:
             return "best_of_n_target_path_logprob"
         return "best_of_n_weighted_target_path_logprob"
+
+    @staticmethod
+    def _validate_route_selection_policy(policy: str) -> str:
+        value = str(policy).strip().lower()
+        if value not in {"target_best", "first_route"}:
+            raise ValueError(
+                "route_selection_policy must be one of: target_best, first_route"
+            )
+        return value
+
+    def _select_route(self, scores: Sequence[TargetRouteScore]) -> TargetRouteScore:
+        if not scores:
+            raise ValueError("cannot select from an empty route score list")
+        if self.route_selection_policy == "first_route":
+            return scores[0]
+        return max(
+            scores,
+            key=lambda item: (
+                self._selection_score(item),
+                item.draft_logprob,
+                -item.route_id,
+            ),
+        )
+
+    @staticmethod
+    def _truncate_selected_path(
+        *,
+        token_ids: Sequence[int],
+        node_ids: Sequence[int],
+        max_tokens: int | None,
+        eos_token_id: int | None,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        if len(token_ids) != len(node_ids) or not token_ids:
+            raise ValueError(
+                "selected path tokens and node ids must have equal non-zero length"
+            )
+        limit = len(token_ids) if max_tokens is None else min(len(token_ids), int(max_tokens))
+        if limit <= 0:
+            raise ValueError("selected_path_max_tokens must be positive")
+        committed_tokens = [int(token_id) for token_id in token_ids[:limit]]
+        if eos_token_id is not None:
+            for index, token_id in enumerate(committed_tokens):
+                if int(token_id) == int(eos_token_id):
+                    committed_tokens = committed_tokens[: index + 1]
+                    break
+        committed_count = len(committed_tokens)
+        return (
+            tuple(committed_tokens),
+            tuple(int(node_id) for node_id in node_ids[:committed_count]),
+        )
 
     @staticmethod
     def _selection_score(score: TargetRouteScore) -> float:

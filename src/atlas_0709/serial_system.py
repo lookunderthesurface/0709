@@ -75,6 +75,7 @@ class SerialAtlasGenerator(PagedDistributedAtlasGenerator):
                 fallback_max_tokens=min(
                     int(self.config.fallback_ar_tokens), int(remaining_tokens)
                 ),
+                selected_path_max_tokens=int(remaining_tokens),
                 eos_token_id=self.config.eos_token_id,
             )
             verify_elapsed_s = time.perf_counter() - verify_start

@@ -7,6 +7,7 @@ import torch
 from atlas_0709.flashinfer_full_verify import prefix_layer_to_paged_kv
 from atlas_0709.target_runtime import DirectFlashInferMaskedTreeVerifyBackend
 from atlas_0709.target_runtime import VerifyRoutePayload
+from atlas_0709.types import TargetRouteScore
 
 
 def _make_backend() -> DirectFlashInferMaskedTreeVerifyBackend:
@@ -100,3 +101,90 @@ def test_route_scoring_uses_shared_parent_node_logits() -> None:
     parent_lp = torch.log_softmax(verify_logits[0], dim=-1)
     assert abs(scores[0].target_logprob - (prefix_lp + parent_lp[2].item())) < 1e-6
     assert abs(scores[1].target_logprob - (prefix_lp + parent_lp[3].item())) < 1e-6
+
+
+def test_first_route_diagnostic_ignores_target_score() -> None:
+    backend = object.__new__(DirectFlashInferMaskedTreeVerifyBackend)
+    backend.route_selection_policy = "first_route"
+    scores = [
+        TargetRouteScore(
+            route_id=7,
+            token_ids=(11,),
+            target_logprob=-10.0,
+            draft_logprob=-4.0,
+        ),
+        TargetRouteScore(
+            route_id=3,
+            token_ids=(12,),
+            target_logprob=-0.1,
+            draft_logprob=-0.2,
+        ),
+    ]
+
+    assert backend._select_route(scores).route_id == 7
+    assert backend._selection_policy_name() == "diagnostic_first_payload_route"
+
+
+def test_target_best_policy_keeps_existing_tie_break() -> None:
+    backend = object.__new__(DirectFlashInferMaskedTreeVerifyBackend)
+    backend.route_selection_policy = "target_best"
+    backend.score_weights = None
+    scores = [
+        TargetRouteScore(
+            route_id=9,
+            token_ids=(11,),
+            target_logprob=-1.0,
+            draft_logprob=-2.0,
+        ),
+        TargetRouteScore(
+            route_id=4,
+            token_ids=(12,),
+            target_logprob=-1.0,
+            draft_logprob=-1.0,
+        ),
+    ]
+
+    assert backend._select_route(scores).route_id == 4
+
+
+def test_route_selection_policy_validation() -> None:
+    assert (
+        DirectFlashInferMaskedTreeVerifyBackend._validate_route_selection_policy(
+            " FIRST_ROUTE "
+        )
+        == "first_route"
+    )
+    try:
+        DirectFlashInferMaskedTreeVerifyBackend._validate_route_selection_policy(
+            "sample"
+        )
+    except ValueError as exc:
+        assert "target_best, first_route" in str(exc)
+    else:
+        raise AssertionError("invalid route policy was accepted")
+
+
+def test_selected_path_commit_is_truncated_by_budget_and_eos() -> None:
+    tokens, nodes = DirectFlashInferMaskedTreeVerifyBackend._truncate_selected_path(
+        token_ids=(10, 11, 12, 13),
+        node_ids=(20, 21, 22, 23),
+        max_tokens=3,
+        eos_token_id=11,
+    )
+
+    assert tokens == (10, 11)
+    assert nodes == (20, 21)
+
+
+def test_selected_path_commit_rejects_empty_budget() -> None:
+    try:
+        DirectFlashInferMaskedTreeVerifyBackend._truncate_selected_path(
+            token_ids=(10,),
+            node_ids=(20,),
+            max_tokens=0,
+            eos_token_id=None,
+        )
+    except ValueError as exc:
+        assert "must be positive" in str(exc)
+    else:
+        raise AssertionError("empty selected-path commit was accepted")

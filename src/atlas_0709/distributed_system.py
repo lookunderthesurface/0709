@@ -53,6 +53,8 @@ class DistributedAtlasConfig:
     max_new_tokens: int = 64
     eos_token_id: int | None = None
     fallback_ar_tokens: int = 4
+    fixed_forest_depth: int | None = None
+    validate_state_alignment: bool = False
 
     def validate(self) -> None:
         if self.k <= 0:
@@ -63,6 +65,10 @@ class DistributedAtlasConfig:
             raise ValueError("max_new_tokens must be positive")
         if self.fallback_ar_tokens <= 0:
             raise ValueError("fallback_ar_tokens must be positive")
+        if self.fixed_forest_depth is not None and not (
+            0 <= int(self.fixed_forest_depth) <= int(self.d)
+        ):
+            raise ValueError("fixed_forest_depth must be between 0 and d")
 
 
 @dataclass
@@ -214,7 +220,10 @@ class PagedDistributedAtlasGenerator:
                 end_s=self._timeline_now(),
             )
 
-            if not target_prefill_future.done():
+            if (
+                self.config.fixed_forest_depth is None
+                and not target_prefill_future.done()
+            ):
                 prebuilt_forest_frontier = initialize_forest_routes(
                     stage1.completed_routes,
                     stage1.last_logits,
@@ -251,6 +260,7 @@ class PagedDistributedAtlasGenerator:
         round_index = 0
         with ThreadPoolExecutor(max_workers=1) as verifier_pool:
             while len(generated) < self.config.max_new_tokens:
+                round_prefix_len = len(committed)
                 verify_routes = self._route_payloads(ctx.store, stage1.completed_routes)
                 verify_submit_s = self._timeline_now()
                 remaining_tokens = self.config.max_new_tokens - len(generated)
@@ -277,7 +287,10 @@ class PagedDistributedAtlasGenerator:
                         k=self.config.k,
                         route_store=ctx.store,
                     )
-                while not verify_future.done() and forest_depth < self.config.d:
+                while self._should_build_forest_step(
+                    verify_done=verify_future.done(),
+                    forest_depth=forest_depth,
+                ):
                     forest_step_start = self._timeline_now()
                     forest_step = build_forest_one_depth(
                         forest_frontier,
@@ -394,6 +407,22 @@ class PagedDistributedAtlasGenerator:
                 else:
                     raise RuntimeError(f"unknown target verify decision: {decision!r}")
 
+                if self.config.validate_state_alignment:
+                    self._validate_target_prefix_lengths(
+                        target_verify_metadata,
+                        expected_before=round_prefix_len,
+                        expected_after=len(committed),
+                    )
+                    if not should_stop:
+                        self._validate_drafter_prefix_state(
+                            ctx,
+                            committed,
+                            active_routes=[
+                                *stage1.completed_routes,
+                                *stage1.next_frontier_routes,
+                            ],
+                        )
+
                 traces.append(
                     DistributedRoundTrace(
                         round_index=round_index,
@@ -471,6 +500,8 @@ class PagedDistributedAtlasGenerator:
                 "d": self.config.d,
                 "max_new_tokens": self.config.max_new_tokens,
                 "fallback_ar_tokens": int(self.config.fallback_ar_tokens),
+                "fixed_forest_depth": self.config.fixed_forest_depth,
+                "validate_state_alignment": bool(self.config.validate_state_alignment),
                 "rebuild_drafter_prefix_after_commit": False,
                 "rebuild_drafter_prefix_after_fallback": False,
                 "fallback_drafter_handoff": "single_multi_token_extend",
@@ -507,9 +538,108 @@ class PagedDistributedAtlasGenerator:
             prefix_token_ids=committed,
             routes=routes,
             fallback_max_tokens=min(int(self.config.fallback_ar_tokens), int(remaining_tokens)),
+            selected_path_max_tokens=int(remaining_tokens),
             eos_token_id=self.config.eos_token_id,
         )
         return response, self._timeline_now()
+
+    def _should_build_forest_step(
+        self,
+        *,
+        verify_done: bool,
+        forest_depth: int,
+    ) -> bool:
+        if int(forest_depth) >= int(self.config.d):
+            return False
+        fixed_depth = self.config.fixed_forest_depth
+        if fixed_depth is not None:
+            return int(forest_depth) < int(fixed_depth)
+        return not bool(verify_done)
+
+    @staticmethod
+    def _validate_target_prefix_lengths(
+        metadata: dict[str, object],
+        *,
+        expected_before: int,
+        expected_after: int,
+    ) -> None:
+        observed_before = int(metadata.get("prefix_len_before", -1))
+        observed_after = int(metadata.get("prefix_len_after", -1))
+        if observed_before != int(expected_before) or observed_after != int(expected_after):
+            raise RuntimeError(
+                "Target committed-prefix length diverged from the coordinator: "
+                f"target={observed_before}->{observed_after}, "
+                f"coordinator={int(expected_before)}->{int(expected_after)}"
+            )
+
+    @staticmethod
+    def _validate_drafter_prefix_state(
+        ctx: PagedPrefixContext,
+        committed: Sequence[int],
+        *,
+        active_routes: Sequence[RouteState],
+    ) -> None:
+        expected = [int(token_id) for token_id in committed]
+        backend_tokens = [int(token_id) for token_id in ctx.backend.prefix_token_ids]
+        store_tokens = [int(token_id) for token_id in ctx.store.committed_token_ids]
+        prefix_slots = ctx.backend.route_pool.prefix_slot_ids
+        if backend_tokens != expected or store_tokens != expected:
+            raise RuntimeError(
+                "Drafter logical committed prefix diverged from the coordinator"
+            )
+        if prefix_slots is None or int(prefix_slots.numel()) != len(expected):
+            observed_slots = None if prefix_slots is None else int(prefix_slots.numel())
+            raise RuntimeError(
+                "Drafter physical prefix length diverged from the coordinator: "
+                f"slots={observed_slots}, tokens={len(expected)}"
+            )
+        for route in active_routes:
+            route_id = int(route.route_id)
+            slot_path = ctx.backend.route_pool.route_slot_paths.get(route_id)
+            if slot_path is None:
+                raise RuntimeError(f"Drafter route {route_id} has no physical slot path")
+            actual_slots = [int(slot_id) for slot_id in slot_path.detach().cpu().tolist()]
+            expected_suffix: list[int] = []
+            for node_id in route.kv_view.node_ids:
+                slot_id = ctx.backend.route_pool.node_slot_ids.get(int(node_id))
+                if slot_id is None:
+                    raise RuntimeError(
+                        f"Drafter route {route_id} node {int(node_id)} has no physical KV slot"
+                    )
+                if isinstance(slot_id, torch.Tensor):
+                    expected_suffix.append(int(slot_id.detach().cpu()))
+                else:
+                    expected_suffix.append(int(slot_id))
+            committed_length = int(route.kv_view.prefix.committed_length)
+            if actual_slots[committed_length:] != expected_suffix:
+                raise RuntimeError(
+                    f"Drafter route {route_id} physical slots do not match its logical node path"
+                )
+            row = ctx.backend.route_pool.route_rows.get(route_id)
+            if row is not None and int(row.written_length) != len(actual_slots):
+                raise RuntimeError(
+                    f"Drafter route {route_id} req-row length is inconsistent: "
+                    f"row={int(row.written_length)}, slots={len(actual_slots)}"
+                )
+            req_table = getattr(
+                ctx.backend.route_pool.req_to_token_pool,
+                "req_to_token",
+                None,
+            )
+            if row is not None and isinstance(req_table, torch.Tensor):
+                req_slots = [
+                    int(slot_id)
+                    for slot_id in req_table[
+                        int(row.req_pool_index), : len(actual_slots)
+                    ]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
+                if req_slots != actual_slots:
+                    raise RuntimeError(
+                        f"Drafter route {route_id} req row does not match its physical slot path"
+                    )
 
     def _prepare_prefix(self, committed: Sequence[int]) -> PagedPrefixContext:
         store = KVTreeStore()
@@ -800,6 +930,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat-token-id", type=int, default=None)
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--d", type=int, default=4)
+    parser.add_argument(
+        "--fixed-forest-depth",
+        type=int,
+        default=None,
+        help=(
+            "Correctness/replay diagnostic: build exactly this many forest depths "
+            "per round instead of stopping on Target wall-clock completion."
+        ),
+    )
+    parser.add_argument(
+        "--validate-state-alignment",
+        action="store_true",
+        help=(
+            "Correctness diagnostic: assert Target/Drafter/coordinator committed "
+            "prefix lengths and tokens after every non-terminal handoff."
+        ),
+    )
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--eos-token-id", type=int, default=None)
     parser.add_argument(
@@ -919,6 +1066,8 @@ def main() -> int:
                     max_new_tokens=warmup_generated_tokens,
                     eos_token_id=None,
                     fallback_ar_tokens=args.fallback_ar_tokens,
+                    fixed_forest_depth=args.fixed_forest_depth,
+                    validate_state_alignment=args.validate_state_alignment,
                 ),
                 runner=runner,
                 page_size=args.page_size,
@@ -943,6 +1092,8 @@ def main() -> int:
                 max_new_tokens=args.max_new_tokens,
                 eos_token_id=args.eos_token_id,
                 fallback_ar_tokens=args.fallback_ar_tokens,
+                fixed_forest_depth=args.fixed_forest_depth,
+                validate_state_alignment=args.validate_state_alignment,
             ),
             runner=runner,
             page_size=args.page_size,

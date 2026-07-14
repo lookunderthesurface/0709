@@ -83,6 +83,7 @@ class TargetServerApp:
         prefix = request.get("prefix_token_ids")
         routes = request.get("routes")
         fallback_max_tokens = request.get("fallback_max_tokens")
+        selected_path_max_tokens = request.get("selected_path_max_tokens")
         eos_token_id = request.get("eos_token_id")
         if not isinstance(prefix, list):
             raise ValueError("verify requires prefix_token_ids: list[int]")
@@ -95,6 +96,11 @@ class TargetServerApp:
                 routes=payloads,
                 fallback_max_tokens=(
                     None if fallback_max_tokens is None else int(fallback_max_tokens)
+                ),
+                selected_path_max_tokens=(
+                    None
+                    if selected_path_max_tokens is None
+                    else int(selected_path_max_tokens)
                 ),
                 eos_token_id=(None if eos_token_id is None else int(eos_token_id)),
             )
@@ -132,12 +138,14 @@ class InProcessTargetClient:
         prefix_token_ids: Sequence[int],
         routes: Sequence[Mapping[str, object]],
         fallback_max_tokens: int | None = None,
+        selected_path_max_tokens: int | None = None,
         eos_token_id: int | None = None,
     ) -> dict[str, object]:
         result = self.backend.verify_payloads(
             prefix_token_ids=prefix_token_ids,
             routes=[verify_payload_from_mapping(dict(item)) for item in routes],
             fallback_max_tokens=fallback_max_tokens,
+            selected_path_max_tokens=selected_path_max_tokens,
             eos_token_id=eos_token_id,
         )
         return {"ok": True, **target_verify_result_to_dict(result)}
@@ -233,6 +241,7 @@ class RemoteTargetClient:
         prefix_token_ids: Sequence[int],
         routes: Sequence[Mapping[str, object]],
         fallback_max_tokens: int | None = None,
+        selected_path_max_tokens: int | None = None,
         eos_token_id: int | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -241,6 +250,8 @@ class RemoteTargetClient:
         }
         if fallback_max_tokens is not None:
             payload["fallback_max_tokens"] = int(fallback_max_tokens)
+        if selected_path_max_tokens is not None:
+            payload["selected_path_max_tokens"] = int(selected_path_max_tokens)
         if eos_token_id is not None:
             payload["eos_token_id"] = int(eos_token_id)
         return self._post("/verify", payload)
