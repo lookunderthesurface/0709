@@ -587,6 +587,36 @@ python tools/smoke_mock.py
 python tools/smoke_reuse_handoff.py
 ```
 
+Strict end-to-end greedy-equivalence diagnostic:
+
+```bash
+# Target process. Omit both fallback thresholds.
+python -m atlas_0709.target_server \
+  --model /home/hwc/models/Meta-Llama-3.1-8B-Instruct \
+  --host 127.0.0.1 --port 18109 \
+  --k 1 --d 4 --page-size 16 --dtype float16 \
+  --route-selection-policy first_route
+
+# Drafter process. Fixed depths remove wall-clock scheduling from correctness.
+PYTHONHASHSEED=0 CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+python tools/check_async_greedy_equivalence.py \
+  --drafter-model /home/hwc/models/Llama-3.2-1B-Instruct \
+  --target-url http://127.0.0.1:18109 \
+  --prompt "ATLAS KV equivalence." \
+  --d 4 --forest-depths 0,1,2,3,4 \
+  --max-new-tokens 64 --repeats 2 \
+  --deterministic-algorithms \
+  --json-out ../0709_outputs/kv_equivalence.json
+```
+
+This is intentionally a `k=1` test. For `k>1`, the first payload route is the
+highest cumulative-probability beam path and is not generally the Drafter's
+token-by-token greedy path. The diagnostic compares exact token IDs against
+`FlashInferPagedGreedyARGenerator` and checks fixed forest depths independently.
+It also enables per-round coordinator/Drafter/Target prefix, physical slot-path,
+and request-row assertions. The production default remains Target best-path
+selection with wall-clock-controlled forest completion.
+
 Real Drafter route-KV alignment check with normal 16-token pages:
 
 ```bash
@@ -607,19 +637,25 @@ committing a stage-1 route and promoting its retained second-stage KV. It fails
 if any FlashInfer frontier falls outside the configured HF logit tolerance.
 The report also records copied COW pages/tokens.
 
-Two-round real Target KV commit check:
+Multi-round real Target KV commit check:
 
 ```bash
 python tools/smoke_target_incremental_commit.py \
-  --model /workspace/models/Llama-3.2-1B \
+  --model /home/hwc/models/Meta-Llama-3.1-8B-Instruct \
   --prompt-token-ids 1,2,3,4,5,6,7,8 \
   --d 4 \
   --page-size 16 \
-  --dtype float16
+  --dtype float16 \
+  --rounds 16 \
+  --route-selection-policy first_route \
+  --json-out ../0709_outputs/target_incremental_vs_fresh.json
 ```
 
-The smoke compares logits from the committed masked-tree KV against a fresh HF
-prefill, then performs a second verify using only the persisted Target paged KV.
+After every route commit, the smoke compares both the canonical paged KV and
+next-token logits against a fresh full-prefix HF recomputation. It reports
+maximum and mean absolute differences and requires the next-token top-1 to
+match. Small nonzero FP16 differences are expected because masked-tree and
+linear-prefill kernels use different reduction layouts.
 
 ## Isolated component timing
 

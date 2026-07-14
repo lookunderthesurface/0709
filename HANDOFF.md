@@ -1358,3 +1358,83 @@ The user's experiment preferences are evidence-first and controlled:
   entry-point existence checks, and the full Python invocation.
 - The local Windows workspace can support static checks but not genuine
   SGLang/FlashInfer GPU validation. State that limitation precisely.
+
+## 12. 2026-07-15 KV Semantics and Greedy-Equivalence Audit
+
+Commits `98e41fb` and `4e59f20` add correctness-only controls without changing
+the default production selection or scheduler:
+
+- Target `--route-selection-policy first_route` scores every input path but
+  commits the first payload route. It rejects enabled fallback thresholds.
+- `DistributedAtlasConfig.fixed_forest_depth` removes the Target wall-clock
+  boundary from replay experiments; depths `0..d` can be tested separately.
+- `--validate-state-alignment` checks coordinator, Drafter logical prefix,
+  physical prefix slots, route node-to-slot mappings, and available req rows
+  after every active handoff.
+- The Edge now sends `selected_path_max_tokens`; Target applies the same output
+  budget/EOS truncation before committing KV. Previously the terminal Target
+  cache could contain the unused tail of a full `d`-token route.
+- Target verifies route count/depth, unique route IDs, and exposes tokenizer
+  vocabulary/special-token metadata through health.
+
+Important definition: first route is not Drafter greedy AR when `k>1`. The
+frontier is global beam search by cumulative draft log probability. Exact
+greedy equivalence is therefore tested with `k=1`; k=3 correctness needs the
+separate all-frontier HF check or a future protected greedy-spine oracle.
+
+Herta unit/control result at `4e59f20`: all 51 test functions passed. The
+`atlas` environment did not contain pytest, so a dependency-free collector
+executed the same plain-assert tests and supplied the three monkeypatch fixtures.
+
+Real H800 results (FP16, page size 16, deterministic-algorithms requested,
+TF32 off, seed 0, no algorithmic sampling):
+
+1. `k=1`, prefix length 15, 32 generated tokens, fixed forest depths
+   `0,1,2,3,4`, two repeats per depth: all 10 ATLAS trajectories exactly
+   matched independent Drafter paged greedy AR token-for-token. Every AR and
+   ATLAS token hash was
+   `cba8b40d8bd3cf4970845429ca32ca95beb1c5aace2ac15c15cc75eb9aa52d2c`.
+2. Chat-template prompt `Hello`, 64 generated tokens, fixed depths `0,2,4`,
+   two repeats per depth: all six trajectories and both AR repeats had the same
+   token hash
+   `fec14f9e97f45fd0577fd16ba0b5e59e8756d4e4fe39626431ed740d1d9dbc46`.
+3. Terminal budget 17 with `d=4`, fixed depth 2, two repeats: exact AR match.
+   The last round committed one token and Target prefix length changed
+   `52 -> 53`, confirming the terminal over-commit fix.
+4. Target first-route persistent-KV versus fresh full-prefix HF, 16 rounds,
+   prefix `15 -> 79`: 16/16 next-token top-1 matched. Across all rounds,
+   canonical-KV max abs diff was `0.044921875`; the final mean abs diff was
+   `0.0009161857`; next-logit max abs diff was `0.03515625`.
+5. Drafter `k=3,d=4` real tree/forest/post-commit HF alignment passed at the
+   prefix-15 partial-page boundary. Maximum absolute logit differences were
+   `0.0546875` (tree), `0.0517578125` (forest), and `0.03125`
+   (post-commit); every checked frontier row had top-1 match rate `1.0`.
+
+Artifacts:
+
+```text
+/home/hwc/workspace/0701/0709_outputs/kv_semantics_98e41fb/k1_async_vs_ar_short.json
+/home/hwc/workspace/0701/0709_outputs/kv_semantics_98e41fb/k1_async_vs_ar_chat.json
+/home/hwc/workspace/0701/0709_outputs/kv_semantics_98e41fb/k1_terminal_budget17.json
+/home/hwc/workspace/0701/0709_outputs/kv_semantics_98e41fb/target_incremental_vs_fresh_4round.json
+/home/hwc/workspace/0701/0709_outputs/kv_semantics_98e41fb/target_incremental_vs_fresh_16round.json
+/home/hwc/workspace/0701/0709_outputs/kv_semantics_98e41fb/drafter_k3_hf_prefix15.json
+```
+
+Interpretation: the tested persistent KV/history paths are structurally and
+semantically consistent. Small FP16 differences against fresh HF recomputation
+remain and can flip a near-tied beam cutoff; these results do not prove bitwise
+equivalence or all k=3 route-selection cases. Still missing for a publication
+correctness appendix: forced selection of every k=3 route/rank, long prefixes
+and all page boundaries, hundreds of allocation/recycle rounds, fixed-depth
+fresh-process replay, stable exact-tie handling, and per-node Target margins.
+
+Paper readiness after this audit: runtime prototype about 70%, correctness
+evidence about 55%, core deadline-aware anytime policy about 15%, paper-level
+evaluation about 20%, and overall main-conference readiness about 30%. The next
+research gate is not another micro-optimization: first run a fixed-policy grid
+plus hindsight deadline oracle. Only implement an online policy if the oracle
+shows a meaningful quality/latency/GPU-work Pareto gap over the best fixed
+policy. A main-paper result also needs multiple model pairs, real separated
+Edge/Cloud hardware, RTT/jitter/queue sweeps, full tasks, strong sync/async tree
+baselines, ablations, and paired confidence intervals.
