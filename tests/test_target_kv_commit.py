@@ -74,6 +74,7 @@ def test_hf_prefix_kv_is_written_in_flashinfer_page_order() -> None:
 
 def test_route_scoring_uses_shared_parent_node_logits() -> None:
     backend = object.__new__(DirectFlashInferMaskedTreeVerifyBackend)
+    backend.score_weights = None
     prefix_logits = torch.tensor([0.0, 3.0, 0.0, 0.0])
     verify_logits = torch.tensor(
         [
