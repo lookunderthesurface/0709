@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import statistics
 import sys
 import time
@@ -29,7 +30,12 @@ from atlas_0709.flashinfer_paged.builders import (
     initialize_stage1_routes,
 )
 from atlas_0709.flashinfer_paged.frontier import advance_frontier_one_token
+from atlas_0709.flashinfer_paged.flashinfer_backends import SGLangRouteKVMetadata
 from atlas_0709.flashinfer_paged.kv import KVTreeStore
+from atlas_0709.flashinfer_paged.paged_metadata import (
+    build_flashinfer_paged_kv_metadata,
+)
+from atlas_0709.flashinfer_paged.sglang_page_attention import AtlasPagedDecodeSpec
 from atlas_0709.flashinfer_paged.sglang_runtime import (
     SGLangFlashInferFrontierModelBackend,
     SGLangRunnerConfig,
@@ -65,6 +71,31 @@ class FrontierState:
     k: int
 
 
+@dataclass
+class NativeBatchARState:
+    """Direct SGLang batch AR state without ATLAS route materialization."""
+
+    context: PreparedDraftContext
+    route_ids: list[int]
+    req_pool_indices: torch.Tensor
+    slot_paths: list[torch.Tensor]
+    input_ids: torch.Tensor
+    sequence_length: int
+    counter_totals: dict[str, int]
+
+
+@dataclass(frozen=True)
+class NativeBatchARDecodeOutput:
+    next_token_logits: torch.Tensor
+    metadata: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class NativeBatchARStepResult:
+    decode_output: NativeBatchARDecodeOutput
+    selection_stats: None = None
+
+
 @dataclass(frozen=True)
 class Timing:
     median_ms: float
@@ -77,6 +108,21 @@ class Timing:
             "mean_ms": self.mean_ms,
             "samples_ms": self.samples_ms,
         }
+
+
+@dataclass(frozen=True)
+class _MeasuredSteppedIteration:
+    total_ms: float
+    step_ms: list[float]
+    counter_deltas: list[dict[str, int]]
+    counter_cumulative: list[dict[str, int]]
+    counter_total_delta: dict[str, int]
+
+
+@dataclass(frozen=True)
+class _MeasuredCriticalPathIteration:
+    total_ms: float
+    counter_total_delta: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -116,6 +162,33 @@ class SteppedTiming:
         if self.measurement_syncs:
             report["measurement_syncs"] = dict(self.measurement_syncs)
         return report
+
+
+@dataclass(frozen=True)
+class CriticalPathTiming:
+    """End-to-end stepped workload timing with CUDA syncs only at boundaries."""
+
+    total: Timing
+    counter_total_delta_samples: list[dict[str, int]] = field(default_factory=list)
+    measurement_syncs: Mapping[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        report: dict[str, object] = {"total": self.total.to_dict()}
+        if self.counter_total_delta_samples:
+            report["hot_path_counter_total_delta"] = summarize_counter_samples(
+                self.counter_total_delta_samples
+            )
+        if self.measurement_syncs:
+            report["measurement_syncs"] = dict(self.measurement_syncs)
+        return report
+
+
+@dataclass(frozen=True)
+class PairedCriticalPathTiming:
+    arm_a: CriticalPathTiming
+    arm_b: CriticalPathTiming
+    measurement_protocol: Mapping[str, object]
+    paired_comparison: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -210,6 +283,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--skip-tree", action="store_true")
     parser.add_argument("--skip-forest", action="store_true")
+    parser.add_argument(
+        "--skip-native-batch-ar",
+        action="store_true",
+        help="Skip the direct GPU-resident SGLang batch-AR control.",
+    )
+    parser.add_argument(
+        "--pair-order-seed",
+        type=int,
+        default=0,
+        help="Rotate the balanced ABBA order for native-AR versus tree/forest pairs.",
+    )
     parser.add_argument("--skip-verify", action="store_true")
     parser.add_argument(
         "--legacy-token-attention-metadata",
@@ -264,7 +348,12 @@ def subtract_counters(
     }
 
 
-def state_hot_path_counters(state: FrontierState) -> dict[str, int]:
+def state_hot_path_counters(state: Any) -> dict[str, int]:
+    if isinstance(state, NativeBatchARState):
+        return {
+            str(key): int(value)
+            for key, value in state.counter_totals.items()
+        }
     counter_fn = getattr(state.context.backend.route_pool, "hot_path_counters", None)
     if not callable(counter_fn):
         return {}
@@ -425,6 +514,232 @@ def setup_forest_state(
     return FrontierState(context=context, routes=forest_routes, k=k)
 
 
+def prepare_frontier_decode_ready(state: FrontierState) -> FrontierState:
+    """Move lazy row initialization and writer COW outside decode timing.
+
+    ATLAS normally performs these operations lazily in the first frontier
+    step.  The native batch-AR baseline starts from already initialized
+    requests, so the primary scientific comparison uses this common
+    decode-ready boundary for both arms.  The original component benchmark is
+    still reported separately and keeps the production lazy costs.
+    """
+
+    if not state.routes:
+        raise ValueError("decode-ready frontier cannot be empty")
+    bridge = state.context.backend.route_pool
+    bridge.ensure_route_rows(state.routes)
+    slot_paths = [bridge._slot_path_for_route(route) for route in state.routes]
+    slot_paths, _ = bridge._copy_partial_tail_pages_with_dirty_starts(
+        state.routes,
+        slot_paths,
+    )
+    lengths = {int(slot_path.numel()) for slot_path in slot_paths}
+    if len(lengths) != 1:
+        raise RuntimeError("decode-ready frontier routes have unequal KV lengths")
+
+    for route, slot_path in zip(state.routes, slot_paths):
+        route_id = int(route.route_id)
+        row = bridge.route_rows[route_id]
+        bridge._write_req_token_row(int(row.req_pool_index), slot_path)
+        row.written_length = int(slot_path.numel())
+        row.pending_dirty_start = None
+        bridge.route_slot_paths[route_id] = slot_path
+    return state
+
+
+def setup_native_batch_ar_state(
+    *,
+    frontier_state: FrontierState,
+    decode_steps: int,
+) -> NativeBatchARState:
+    """Convert an exactly matched ATLAS frontier into direct native batch AR.
+
+    The logical histories, initial pending token ids, physical page-16 KV,
+    allocator state, sequence order, and request-row initialization all come
+    from the same tree/forest setup used by the comparison arm.  Timed decode
+    then bypasses RouteState/KVTree/candidate materialization and retains the
+    greedy continuation on GPU.
+    """
+
+    frontier_state = prepare_frontier_decode_ready(frontier_state)
+    bridge = frontier_state.context.backend.route_pool
+    slot_paths = [
+        bridge._slot_path_for_route(route) for route in frontier_state.routes
+    ]
+    lengths = {int(slot_path.numel()) for slot_path in slot_paths}
+    if len(lengths) != 1:
+        raise RuntimeError("native batch AR requires equal-length histories")
+    sequence_length = next(iter(lengths))
+    if int(decode_steps) <= 0:
+        raise ValueError("native batch AR decode_steps must be positive")
+    if (
+        bridge.max_context_len is not None
+        and sequence_length + int(decode_steps) > int(bridge.max_context_len)
+    ):
+        raise RuntimeError(
+            "native batch AR request rows are too short for the measured decode"
+        )
+    route_ids = [int(route.route_id) for route in frontier_state.routes]
+    req_pool_index_list = [
+        int(bridge.route_rows[route_id].req_pool_index) for route_id in route_ids
+    ]
+    if len(set(req_pool_index_list)) != len(req_pool_index_list):
+        raise RuntimeError("native batch AR request rows must be unique")
+    req_pool_indices = torch.tensor(
+        req_pool_index_list,
+        device=bridge.device,
+        dtype=torch.long,
+    )
+    input_ids = torch.tensor(
+        [int(route.pending_token_id) for route in frontier_state.routes],
+        device=bridge.device,
+        dtype=torch.long,
+    )
+    counters = bridge.hot_path_counters()
+    counters.update(
+        {
+            "native_gpu_argmax_calls": 0,
+            "native_req_row_batch_write_calls": 0,
+        }
+    )
+    return NativeBatchARState(
+        context=frontier_state.context,
+        route_ids=route_ids,
+        req_pool_indices=req_pool_indices,
+        slot_paths=slot_paths,
+        input_ids=input_ids,
+        sequence_length=sequence_length,
+        counter_totals=counters,
+    )
+
+
+def _assert_unique_native_output_slots(output_slot_ids: torch.Tensor) -> None:
+    if int(output_slot_ids.numel()) <= 1:
+        return
+    duplicates = output_slot_ids[:, None].eq(output_slot_ids[None, :])
+    duplicates.fill_diagonal_(False)
+    condition = duplicates.logical_not().all()
+    if condition.device.type == "cpu":
+        if not bool(condition.item()):
+            raise RuntimeError("native batch AR allocator returned duplicate KV slots")
+        return
+    assert_async = getattr(torch, "_assert_async", None)
+    if not callable(assert_async):
+        raise RuntimeError("native CUDA validation requires torch._assert_async")
+    assert_async(condition, "native batch AR allocator returned duplicate KV slots")
+
+
+@torch.inference_mode()
+def run_native_batch_ar_step(state: NativeBatchARState) -> NativeBatchARStepResult:
+    bridge = state.context.backend.route_pool
+    batch_size = int(state.req_pool_indices.numel())
+    previous_len = int(state.sequence_length)
+    seq_len = previous_len + 1
+    last_locs = torch.cat(
+        [slot_path[-1:].to(dtype=torch.long) for slot_path in state.slot_paths],
+        dim=0,
+    )
+    output_slot_ids = bridge.allocate_decode_slots(
+        seq_lens=[seq_len] * batch_size,
+        last_locs=last_locs,
+    )
+    if int(output_slot_ids.numel()) != batch_size:
+        raise RuntimeError("native batch AR allocator returned the wrong slot count")
+    _assert_unique_native_output_slots(output_slot_ids)
+    bridge._record_pending_owned_slots(output_slot_ids)
+
+    append_positions = torch.full(
+        (batch_size,),
+        previous_len,
+        device=output_slot_ids.device,
+        dtype=torch.long,
+    )
+    bridge.req_to_token_pool.write(
+        (state.req_pool_indices, append_positions),
+        output_slot_ids,
+    )
+    full_slot_paths = [
+        torch.cat((slot_path, output_slot_ids[index : index + 1]), dim=0)
+        for index, slot_path in enumerate(state.slot_paths)
+    ]
+
+    seq_lens_cpu = torch.full((batch_size,), seq_len, dtype=torch.long)
+    seq_lens = seq_lens_cpu.to(device=output_slot_ids.device)
+    paged_decode_spec = None
+    attention_page_size = 1
+    page_index_count = batch_size * seq_len
+    if bridge.use_page_attention_metadata:
+        paged = build_flashinfer_paged_kv_metadata(
+            full_slot_paths,
+            page_size=bridge.page_size,
+            validate_layout=bridge.validate_page_layout,
+        )
+        paged_decode_spec = AtlasPagedDecodeSpec(
+            kv_indptr=paged.kv_indptr,
+            kv_indices=paged.kv_page_indices,
+            kv_last_page_len=paged.kv_last_page_len,
+            page_size=int(paged.page_size),
+        )
+        attention_page_size = int(paged.page_size)
+        page_index_count = int(paged.page_index_count)
+    metadata = SGLangRouteKVMetadata(
+        req_pool_indices=state.req_pool_indices,
+        seq_lens=seq_lens,
+        out_cache_loc=output_slot_ids,
+        positions=append_positions,
+        seq_lens_sum=batch_size * seq_len,
+        seq_lens_cpu=seq_lens_cpu,
+        orig_seq_lens=seq_lens,
+        attention_page_size=attention_page_size,
+        token_index_count=batch_size * seq_len,
+        page_index_count=page_index_count,
+        paged_decode_spec=paged_decode_spec,
+    )
+    logits = state.context.backend.executor.forward_frontier(
+        input_ids=state.input_ids,
+        route_kv_metadata=metadata,
+    )
+    next_input_ids = torch.argmax(logits, dim=-1).to(dtype=torch.long)
+
+    state.slot_paths = full_slot_paths
+    for route_id, slot_path in zip(state.route_ids, full_slot_paths):
+        bridge.route_slot_paths[int(route_id)] = slot_path
+        bridge.route_rows[int(route_id)].written_length = int(seq_len)
+        bridge.route_rows[int(route_id)].pending_dirty_start = None
+        if previous_len % int(bridge.page_size) == 0:
+            bridge.route_tail_page_keys[int(route_id)] = bridge._new_tail_page_key()
+    state.input_ids = next_input_ids
+    state.sequence_length = seq_len
+    increments = {
+        "attention_metadata_builds": 1,
+        "attention_metadata_token_indices": batch_size * seq_len,
+        "attention_metadata_page_indices": page_index_count,
+        "req_row_write_calls": 1,
+        "req_row_elements_written": batch_size,
+        "req_row_append_calls": 1,
+        "req_row_append_elements": batch_size,
+        "native_gpu_argmax_calls": 1,
+        "native_req_row_batch_write_calls": 1,
+    }
+    for name, value in increments.items():
+        state.counter_totals[name] = int(state.counter_totals.get(name, 0)) + int(value)
+
+    return NativeBatchARStepResult(
+        decode_output=NativeBatchARDecodeOutput(
+            next_token_logits=logits,
+            metadata={
+                "backend": "native_sglang_gpu_batch_ar",
+                "reference_only": False,
+                "paged_kv": bool(bridge.use_page_attention_metadata),
+                "attention_page_size": int(attention_page_size),
+                "gpu_resident_greedy": True,
+                "route_materialization": False,
+                "candidate_host_transfer": False,
+            },
+        )
+    )
+
+
 def run_tree_step(state: FrontierState) -> Any:
     result = build_tree_one_depth(
         state.routes,
@@ -463,93 +778,92 @@ def run_matched_ar_step(
     return result
 
 
-def measure_stepped_component(
+def _run_stepped_warmup(
     *,
-    setup_fn: Callable[[], FrontierState],
-    step_fn: Callable[[FrontierState], Any],
+    setup_fn: Callable[[], Any],
+    step_fn: Callable[[Any], Any],
     depth: int,
-    warmup: int,
-    iters: int,
-) -> SteppedTiming:
-    for _ in range(warmup):
-        state = setup_fn()
-        for _ in range(depth):
-            step_fn(state)
-        sync_cuda()
+) -> None:
+    state = setup_fn()
+    for _ in range(depth):
+        step_fn(state)
+    sync_cuda()
 
-    step_samples: list[list[float]] = [[] for _ in range(depth)]
-    total_samples: list[float] = []
-    counter_delta_samples: list[list[dict[str, int]]] = [
-        [] for _ in range(depth)
-    ]
-    counter_cumulative_samples: list[list[dict[str, int]]] = [
-        [] for _ in range(depth)
-    ]
-    counter_total_delta_samples: list[dict[str, int]] = []
-    for _ in range(iters):
-        state = setup_fn()
-        setup_counters = state_hot_path_counters(state)
-        sync_cuda()
-        total_start = time.perf_counter()
-        step_results: list[Any] = []
-        for step_index in range(depth):
-            sync_cuda()
-            step_start = time.perf_counter()
-            result = step_fn(state)
-            sync_cuda()
-            step_samples[step_index].append(
-                (time.perf_counter() - step_start) * 1000.0
-            )
-            step_results.append(result)
-        total_samples.append((time.perf_counter() - total_start) * 1000.0)
 
-        # Extract Python counter dictionaries only after the timed region.  The
-        # production backend stores an immutable cumulative snapshot in every
-        # step result, so per-depth evidence does not perturb total latency.
-        step_counter_totals = [
-            step_hot_path_counters(result, state)
-            for result in step_results
-        ]
-        step_selection_deltas = [
-            step_selection_counter_delta(result)
-            for result in step_results
-        ]
-        previous_counters = setup_counters
-        cumulative_selection_counters: dict[str, int] = {}
-        for step_index, counters_after_step in enumerate(step_counter_totals):
-            bridge_delta = subtract_counters(
-                counters_after_step,
-                previous_counters,
+def _measure_stepped_iteration(
+    *,
+    setup_fn: Callable[[], Any],
+    step_fn: Callable[[Any], Any],
+    depth: int,
+) -> _MeasuredSteppedIteration:
+    state = setup_fn()
+    setup_counters = state_hot_path_counters(state)
+    sync_cuda()
+    total_start = time.perf_counter()
+    step_results: list[Any] = []
+    step_ms: list[float] = []
+    for _ in range(depth):
+        sync_cuda()
+        step_start = time.perf_counter()
+        result = step_fn(state)
+        sync_cuda()
+        step_ms.append((time.perf_counter() - step_start) * 1000.0)
+        step_results.append(result)
+    total_ms = (time.perf_counter() - total_start) * 1000.0
+
+    # Extract Python counter dictionaries only after the timed region.  The
+    # backend stores an immutable cumulative snapshot in every step result, so
+    # per-depth evidence does not perturb total latency.
+    step_counter_totals = [
+        step_hot_path_counters(result, state)
+        for result in step_results
+    ]
+    step_selection_deltas = [
+        step_selection_counter_delta(result)
+        for result in step_results
+    ]
+    previous_counters = setup_counters
+    cumulative_selection_counters: dict[str, int] = {}
+    counter_deltas: list[dict[str, int]] = []
+    counter_cumulative: list[dict[str, int]] = []
+    for step_index, counters_after_step in enumerate(step_counter_totals):
+        bridge_delta = subtract_counters(counters_after_step, previous_counters)
+        cumulative_selection_counters = add_counters(
+            cumulative_selection_counters,
+            step_selection_deltas[step_index],
+        )
+        counter_deltas.append(
+            add_total_host_transfer_counters(
+                add_counters(bridge_delta, step_selection_deltas[step_index])
             )
-            cumulative_selection_counters = add_counters(
-                cumulative_selection_counters,
-                step_selection_deltas[step_index],
-            )
-            counter_delta_samples[step_index].append(
-                add_total_host_transfer_counters(
-                    add_counters(bridge_delta, step_selection_deltas[step_index])
-                )
-            )
-            counter_cumulative_samples[step_index].append(
-                add_total_host_transfer_counters(
-                    add_counters(
-                        subtract_counters(counters_after_step, setup_counters),
-                        cumulative_selection_counters,
-                    )
-                )
-            )
-            previous_counters = counters_after_step
-        counter_total_delta_samples.append(
+        )
+        counter_cumulative.append(
             add_total_host_transfer_counters(
                 add_counters(
-                    subtract_counters(previous_counters, setup_counters),
+                    subtract_counters(counters_after_step, setup_counters),
                     cumulative_selection_counters,
                 )
             )
         )
+        previous_counters = counters_after_step
+    counter_total_delta = add_total_host_transfer_counters(
+        add_counters(
+            subtract_counters(previous_counters, setup_counters),
+            cumulative_selection_counters,
+        )
+    )
+    return _MeasuredSteppedIteration(
+        total_ms=total_ms,
+        step_ms=step_ms,
+        counter_deltas=counter_deltas,
+        counter_cumulative=counter_cumulative,
+        counter_total_delta=counter_total_delta,
+    )
 
+
+def _measurement_sync_report(*, depth: int, warmup: int, iters: int) -> dict[str, object]:
     measured_syncs_per_iteration = 1 + 2 * int(depth)
-    measurement_syncs = {
+    return {
         "kind": "benchmark_explicit_cuda_synchronize",
         "warmup_after_workload_total": int(warmup),
         "before_timed_region_per_iteration": 1,
@@ -562,13 +876,271 @@ def measure_stepped_component(
         "counter_summary_extraction_in_timed_region": False,
     }
 
+
+def _stepped_timing_from_iterations(
+    iterations: Sequence[_MeasuredSteppedIteration],
+    *,
+    depth: int,
+    warmup: int,
+) -> SteppedTiming:
+    if not iterations:
+        raise ValueError("at least one measured iteration is required")
     return SteppedTiming(
-        total=timing(total_samples),
-        steps=[timing(samples) for samples in step_samples],
-        counter_delta_samples=counter_delta_samples,
-        counter_cumulative_samples=counter_cumulative_samples,
-        counter_total_delta_samples=counter_total_delta_samples,
-        measurement_syncs=measurement_syncs,
+        total=timing([iteration.total_ms for iteration in iterations]),
+        steps=[
+            timing([iteration.step_ms[index] for iteration in iterations])
+            for index in range(depth)
+        ],
+        counter_delta_samples=[
+            [iteration.counter_deltas[index] for iteration in iterations]
+            for index in range(depth)
+        ],
+        counter_cumulative_samples=[
+            [iteration.counter_cumulative[index] for iteration in iterations]
+            for index in range(depth)
+        ],
+        counter_total_delta_samples=[
+            iteration.counter_total_delta for iteration in iterations
+        ],
+        measurement_syncs=_measurement_sync_report(
+            depth=depth,
+            warmup=warmup,
+            iters=len(iterations),
+        ),
+    )
+
+
+def measure_stepped_component(
+    *,
+    setup_fn: Callable[[], Any],
+    step_fn: Callable[[Any], Any],
+    depth: int,
+    warmup: int,
+    iters: int,
+) -> SteppedTiming:
+    for _ in range(warmup):
+        _run_stepped_warmup(setup_fn=setup_fn, step_fn=step_fn, depth=depth)
+    iterations = [
+        _measure_stepped_iteration(
+            setup_fn=setup_fn,
+            step_fn=step_fn,
+            depth=depth,
+        )
+        for _ in range(iters)
+    ]
+    return _stepped_timing_from_iterations(
+        iterations,
+        depth=depth,
+        warmup=warmup,
+    )
+
+
+def _run_critical_path_warmup(
+    *,
+    setup_fn: Callable[[], Any],
+    step_fn: Callable[[Any], Any],
+    depth: int,
+) -> None:
+    state = setup_fn()
+    for _ in range(depth):
+        step_fn(state)
+    sync_cuda()
+
+
+def _measure_critical_path_iteration(
+    *,
+    setup_fn: Callable[[], Any],
+    step_fn: Callable[[Any], Any],
+    depth: int,
+) -> _MeasuredCriticalPathIteration:
+    """Measure d dependent decode steps without host barriers between them."""
+
+    state = setup_fn()
+    setup_counters = state_hot_path_counters(state)
+    sync_cuda()
+    start = time.perf_counter()
+    step_results: list[Any] = []
+    for _ in range(depth):
+        result = step_fn(state)
+        step_results.append(result)
+    sync_cuda()
+    total_ms = (time.perf_counter() - start) * 1000.0
+    selection_counters: dict[str, int] = {}
+    for result in step_results:
+        selection_counters = add_counters(
+            selection_counters,
+            step_selection_counter_delta(result),
+        )
+    counter_total_delta = add_total_host_transfer_counters(
+        add_counters(
+            subtract_counters(state_hot_path_counters(state), setup_counters),
+            selection_counters,
+        )
+    )
+    return _MeasuredCriticalPathIteration(
+        total_ms=total_ms,
+        counter_total_delta=counter_total_delta,
+    )
+
+
+def _critical_path_timing_from_iterations(
+    iterations: Sequence[_MeasuredCriticalPathIteration],
+    *,
+    warmup: int,
+) -> CriticalPathTiming:
+    if not iterations:
+        raise ValueError("at least one critical-path iteration is required")
+    iters = len(iterations)
+    return CriticalPathTiming(
+        total=timing([iteration.total_ms for iteration in iterations]),
+        counter_total_delta_samples=[
+            iteration.counter_total_delta for iteration in iterations
+        ],
+        measurement_syncs={
+            "kind": "benchmark_boundary_cuda_synchronize",
+            "warmup_after_workload_total": int(warmup),
+            "before_timed_region_per_iteration": 1,
+            "workload_completion_inside_timing_per_iteration": 1,
+            "host_barriers_between_depths": 0,
+            "measured_per_iteration": 2,
+            "measured_total": 2 * int(iters),
+            "overall_total": int(warmup) + 2 * int(iters),
+            "counter_summary_extraction_in_timed_region": False,
+        },
+    )
+
+
+def _paired_numeric_summary(values: Sequence[float]) -> dict[str, object]:
+    samples = [float(value) for value in values]
+    return {
+        "median": float(statistics.median(samples)),
+        "mean": float(statistics.fmean(samples)),
+        "samples": samples,
+    }
+
+
+def measure_paired_critical_path_components(
+    *,
+    setup_a: Callable[[], Any],
+    step_a: Callable[[Any], Any],
+    arm_a_name: str,
+    setup_b: Callable[[], Any],
+    step_b: Callable[[Any], Any],
+    arm_b_name: str,
+    depth: int,
+    warmup: int,
+    iters: int,
+    order_seed: int,
+) -> PairedCriticalPathTiming:
+    """Pair two d-step critical paths in ABBA blocks with fresh setup."""
+
+    if int(depth) <= 0:
+        raise ValueError("paired critical-path depth must be positive")
+    if int(iters) < 2 or int(iters) % 2:
+        raise ValueError("paired critical-path iters must be a positive even number")
+    workloads = {
+        "a": (setup_a, step_a),
+        "b": (setup_b, step_b),
+    }
+
+    def round_order(round_index: int) -> tuple[str, str]:
+        return (
+            ("a", "b")
+            if (int(order_seed) + int(round_index)) % 2 == 0
+            else ("b", "a")
+        )
+
+    warmup_orders: list[str] = []
+    for warmup_index in range(int(warmup)):
+        order = round_order(warmup_index)
+        warmup_orders.append("".join(order).upper())
+        for label in order:
+            setup_fn, step_fn = workloads[label]
+            _run_critical_path_warmup(
+                setup_fn=setup_fn,
+                step_fn=step_fn,
+                depth=depth,
+            )
+
+    iterations: dict[str, list[_MeasuredCriticalPathIteration]] = {"a": [], "b": []}
+    measured_orders: list[str] = []
+    for iteration_index in range(int(iters)):
+        order = round_order(iteration_index)
+        measured_orders.append("".join(order).upper())
+        for label in order:
+            setup_fn, step_fn = workloads[label]
+            iterations[label].append(
+                _measure_critical_path_iteration(
+                    setup_fn=setup_fn,
+                    step_fn=step_fn,
+                    depth=depth,
+                )
+            )
+
+    arm_a = _critical_path_timing_from_iterations(
+        iterations["a"],
+        warmup=warmup,
+    )
+    arm_b = _critical_path_timing_from_iterations(
+        iterations["b"],
+        warmup=warmup,
+    )
+    blocks: list[dict[str, object]] = []
+    block_deltas: list[float] = []
+    block_ratios: list[float] = []
+    for block_start in range(0, int(iters), 2):
+        indices = [block_start, block_start + 1]
+        a_samples = [arm_a.total.samples_ms[index] for index in indices]
+        b_samples = [arm_b.total.samples_ms[index] for index in indices]
+        if min(*a_samples, *b_samples) <= 0.0:
+            raise RuntimeError("paired timing samples must be positive")
+        delta_ms = float(statistics.fmean(b_samples) - statistics.fmean(a_samples))
+        ratio = float(
+            math.sqrt(
+                (b_samples[0] * b_samples[1])
+                / (a_samples[0] * a_samples[1])
+            )
+        )
+        block_deltas.append(delta_ms)
+        block_ratios.append(ratio)
+        blocks.append(
+            {
+                "round_indices": indices,
+                "a_sample_indices": indices,
+                "b_sample_indices": indices,
+                "delta_b_minus_a_ms": delta_ms,
+                "geometric_ratio_b_over_a": ratio,
+            }
+        )
+
+    protocol = {
+        "name": "paired_abba_fresh_setup_boundary_sync",
+        "arm_a": str(arm_a_name),
+        "arm_b": str(arm_b_name),
+        "order_seed": int(order_seed),
+        "warmup_round_orders": warmup_orders,
+        "measured_round_orders": measured_orders,
+        "iters_per_arm": int(iters),
+        "fresh_setup_per_sample": True,
+        "setup_and_prefill_timed": False,
+        "host_barriers_between_depths": 0,
+        "complete_abba_blocks": int(iters) // 2,
+    }
+    comparison = {
+        "blocks": blocks,
+        "total": {
+            "delta_b_minus_a_ms": _paired_numeric_summary(block_deltas),
+            "geometric_ratio_b_over_a": _paired_numeric_summary(block_ratios),
+            "unpaired_mean_ratio_b_over_a_diagnostic": (
+                arm_b.total.mean_ms / arm_a.total.mean_ms
+            ),
+        },
+    }
+    return PairedCriticalPathTiming(
+        arm_a=arm_a,
+        arm_b=arm_b,
+        measurement_protocol=protocol,
+        paired_comparison=comparison,
     )
 
 
@@ -662,6 +1234,14 @@ def main() -> int:
         raise SystemExit("--k and --d must be positive")
     if args.warmup < 0 or args.iters <= 0:
         raise SystemExit("--warmup must be non-negative and --iters must be positive")
+    if (
+        not args.skip_native_batch_ar
+        and not (args.skip_tree and args.skip_forest)
+        and (args.iters < 2 or args.iters % 2)
+    ):
+        raise SystemExit(
+            "native batch-AR paired comparison requires an even --iters >= 2"
+        )
 
     print(
         "[isolation] Stop the network Target server before this benchmark when it "
@@ -688,6 +1268,17 @@ def main() -> int:
             "dtype": args.dtype,
             "warmup": int(args.warmup),
             "iters": int(args.iters),
+            "pair_order_seed": int(args.pair_order_seed),
+            "native_batch_ar_enabled": not args.skip_native_batch_ar,
+            "native_batch_ar_definition": (
+                "direct_sglang_forward_gpu_argmax_batched_req_row_append"
+            ),
+            "primary_speed_protocol": "paired_abba_boundary_sync_decode_ready",
+            "primary_speed_setup_boundary": (
+                "prefill_route_initialization_req_rows_and_initial_tail_cow_excluded_"
+                "for_both_arms"
+            ),
+            "cuda_graph_enabled": False,
             "attention_metadata_mode": (
                 "legacy_token_page_size_1"
                 if args.legacy_token_attention_metadata
@@ -800,6 +1391,102 @@ def main() -> int:
                     f"{tree.total.mean_ms / matched_tree_ar.total.mean_ms:9.3f}x"
                 )
 
+                if not args.skip_native_batch_ar:
+                    paired_tree = measure_paired_critical_path_components(
+                        setup_a=lambda: setup_native_batch_ar_state(
+                            frontier_state=setup_tree_state(
+                                runner=runner,
+                                prompt_token_ids=prompt_token_ids,
+                                page_size=args.page_size,
+                                prefill_chunk_size=args.prefill_chunk_size,
+                                k=args.k,
+                            ),
+                            decode_steps=args.d,
+                        ),
+                        step_a=run_native_batch_ar_step,
+                        arm_a_name="native_eager_sglang_batch_ar_page16",
+                        setup_b=lambda: prepare_frontier_decode_ready(
+                            setup_tree_state(
+                                runner=runner,
+                                prompt_token_ids=prompt_token_ids,
+                                page_size=args.page_size,
+                                prefill_chunk_size=args.prefill_chunk_size,
+                                k=args.k,
+                            )
+                        ),
+                        step_b=run_tree_step,
+                        arm_b_name="atlas_tree_global_topk_page16",
+                        depth=args.d,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        order_seed=args.pair_order_seed,
+                    )
+                    tree_native_key = "native_eager_sglang_batch_ar_tree_workload"
+                    tree_ready_key = "build_tree_decode_ready_critical_path"
+                    tree_pair_key = "native_batch_ar_vs_build_tree_paired"
+                    report[tree_native_key] = {
+                        "baseline_scope": "low_level_eager_sglang_model_runner",
+                        "full_scheduler_or_server_baseline": False,
+                        "batch_size": int(args.k),
+                        "decode_steps": int(args.d),
+                        "initial_sequence_length": len(prompt_token_ids),
+                        "final_sequence_length": len(prompt_token_ids) + int(args.d),
+                        "model_input_tokens": int(args.k * args.d),
+                        "initial_state_source": "same_atlas_tree_frontier",
+                        "gpu_resident_greedy": True,
+                        "route_materialization": False,
+                        "candidate_host_transfer": False,
+                        "setup_and_prefill_included": False,
+                        "decode_ready_req_rows_and_tail_cow_excluded": True,
+                        **paired_tree.arm_a.to_dict(),
+                    }
+                    report[tree_ready_key] = {
+                        "batch_size": int(args.k),
+                        "decode_steps": int(args.d),
+                        "initial_sequence_length": len(prompt_token_ids),
+                        "final_sequence_length": len(prompt_token_ids) + int(args.d),
+                        "model_input_tokens": int(args.k * args.d),
+                        "setup_and_prefill_included": False,
+                        "decode_ready_req_rows_and_tail_cow_excluded": True,
+                        **paired_tree.arm_b.to_dict(),
+                    }
+                    report[tree_pair_key] = {
+                        "measurement_protocol": dict(
+                            paired_tree.measurement_protocol
+                        ),
+                        "paired_comparison": dict(paired_tree.paired_comparison),
+                        "arm_a_report_key": tree_native_key,
+                        "arm_b_report_key": tree_ready_key,
+                    }
+                    tree_pair_total = paired_tree.paired_comparison["total"]
+                    tree_pair_ratio = float(
+                        tree_pair_total["geometric_ratio_b_over_a"]["mean"]
+                    )
+                    tree_pair_delta = float(
+                        tree_pair_total["delta_b_minus_a_ms"]["mean"]
+                    )
+                    report["build_tree"][
+                        "paired_decode_ready_geomean_over_native_batch_ar"
+                    ] = tree_pair_ratio
+                    report["build_tree"]["native_batch_ar_paired_report_key"] = (
+                        tree_pair_key
+                    )
+                    print("\n=== Primary paired native batch-AR vs tree ===")
+                    print(
+                        "native_batch_ar_tree_workload  "
+                        f"mean={paired_tree.arm_a.total.mean_ms:9.3f} ms "
+                        f"median={paired_tree.arm_a.total.median_ms:9.3f} ms"
+                    )
+                    print(
+                        "atlas_tree_decode_ready        "
+                        f"mean={paired_tree.arm_b.total.mean_ms:9.3f} ms "
+                        f"median={paired_tree.arm_b.total.median_ms:9.3f} ms"
+                    )
+                    print(
+                        "  paired tree/native-ar       "
+                        f"{tree_pair_ratio:9.3f}x  delta={tree_pair_delta:9.3f} ms"
+                    )
+
             if not args.skip_forest:
                 matched_forest_ar = measure_stepped_component(
                     setup_fn=lambda: setup_forest_state(
@@ -862,6 +1549,108 @@ def main() -> int:
                     f"  mean forest/matched-ar    "
                     f"{forest.total.mean_ms / matched_forest_ar.total.mean_ms:9.3f}x"
                 )
+
+                if not args.skip_native_batch_ar:
+                    paired_forest = measure_paired_critical_path_components(
+                        setup_a=lambda: setup_native_batch_ar_state(
+                            frontier_state=setup_forest_state(
+                                runner=runner,
+                                prompt_token_ids=prompt_token_ids,
+                                page_size=args.page_size,
+                                prefill_chunk_size=args.prefill_chunk_size,
+                                k=args.k,
+                                d=args.d,
+                            ),
+                            decode_steps=args.d,
+                        ),
+                        step_a=run_native_batch_ar_step,
+                        arm_a_name="native_eager_sglang_batch_ar_page16",
+                        setup_b=lambda: prepare_frontier_decode_ready(
+                            setup_forest_state(
+                                runner=runner,
+                                prompt_token_ids=prompt_token_ids,
+                                page_size=args.page_size,
+                                prefill_chunk_size=args.prefill_chunk_size,
+                                k=args.k,
+                                d=args.d,
+                            )
+                        ),
+                        step_b=run_forest_step,
+                        arm_b_name="atlas_forest_per_root_topk_page16",
+                        depth=args.d,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        order_seed=args.pair_order_seed,
+                    )
+                    forest_initial_length = len(prompt_token_ids) + int(args.d)
+                    forest_native_key = (
+                        "native_eager_sglang_batch_ar_forest_workload"
+                    )
+                    forest_ready_key = "build_forest_decode_ready_critical_path"
+                    forest_pair_key = "native_batch_ar_vs_build_forest_paired"
+                    report[forest_native_key] = {
+                        "baseline_scope": "low_level_eager_sglang_model_runner",
+                        "full_scheduler_or_server_baseline": False,
+                        "batch_size": int(args.k * args.k),
+                        "decode_steps": int(args.d),
+                        "initial_sequence_length": forest_initial_length,
+                        "final_sequence_length": forest_initial_length + int(args.d),
+                        "model_input_tokens": int(args.k * args.k * args.d),
+                        "initial_state_source": "same_atlas_forest_frontier",
+                        "gpu_resident_greedy": True,
+                        "route_materialization": False,
+                        "candidate_host_transfer": False,
+                        "setup_and_prefill_included": False,
+                        "decode_ready_req_rows_and_tail_cow_excluded": True,
+                        **paired_forest.arm_a.to_dict(),
+                    }
+                    report[forest_ready_key] = {
+                        "batch_size": int(args.k * args.k),
+                        "decode_steps": int(args.d),
+                        "initial_sequence_length": forest_initial_length,
+                        "final_sequence_length": forest_initial_length + int(args.d),
+                        "model_input_tokens": int(args.k * args.k * args.d),
+                        "setup_and_prefill_included": False,
+                        "decode_ready_req_rows_and_tail_cow_excluded": True,
+                        **paired_forest.arm_b.to_dict(),
+                    }
+                    report[forest_pair_key] = {
+                        "measurement_protocol": dict(
+                            paired_forest.measurement_protocol
+                        ),
+                        "paired_comparison": dict(paired_forest.paired_comparison),
+                        "arm_a_report_key": forest_native_key,
+                        "arm_b_report_key": forest_ready_key,
+                    }
+                    forest_pair_total = paired_forest.paired_comparison["total"]
+                    forest_pair_ratio = float(
+                        forest_pair_total["geometric_ratio_b_over_a"]["mean"]
+                    )
+                    forest_pair_delta = float(
+                        forest_pair_total["delta_b_minus_a_ms"]["mean"]
+                    )
+                    report["build_forest"][
+                        "paired_decode_ready_geomean_over_native_batch_ar"
+                    ] = forest_pair_ratio
+                    report["build_forest"]["native_batch_ar_paired_report_key"] = (
+                        forest_pair_key
+                    )
+                    print("\n=== Primary paired native batch-AR vs forest ===")
+                    print(
+                        "native_batch_ar_forest_workload "
+                        f"mean={paired_forest.arm_a.total.mean_ms:9.3f} ms "
+                        f"median={paired_forest.arm_a.total.median_ms:9.3f} ms"
+                    )
+                    print(
+                        "atlas_forest_decode_ready       "
+                        f"mean={paired_forest.arm_b.total.mean_ms:9.3f} ms "
+                        f"median={paired_forest.arm_b.total.median_ms:9.3f} ms"
+                    )
+                    print(
+                        "  paired forest/native-ar     "
+                        f"{forest_pair_ratio:9.3f}x  "
+                        f"delta={forest_pair_delta:9.3f} ms"
+                    )
     finally:
         runner = None
         if torch.distributed.is_available() and torch.distributed.is_initialized():

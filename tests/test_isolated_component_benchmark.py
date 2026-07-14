@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from benchmarks.bench_atlas_0709_isolated_components import (
+    NativeBatchARState,
     PerRouteTop1Selection,
+    measure_paired_critical_path_components,
     measure_stepped_component,
+    run_native_batch_ar_step,
 )
 from atlas_0709.flashinfer_paged.types import (
     DecodePhase,
@@ -189,3 +193,181 @@ def test_matched_ar_selection_keeps_one_greedy_child_per_route() -> None:
         k=1,
         active_routes=active_routes,
     ).tolist() == [0, 1]
+
+
+def test_paired_critical_path_uses_abba_and_only_boundary_syncs(monkeypatch) -> None:
+    setup_order: list[str] = []
+    setup_counts = {"A": 0, "B": 0}
+    sync_calls = 0
+
+    def fake_sync_cuda() -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+
+    def setup(label: str) -> SimpleNamespace:
+        setup_order.append(label)
+        setup_counts[label] += 1
+        state = make_fake_state()
+        state.label = label
+        return state
+
+    monkeypatch.setattr(
+        "benchmarks.bench_atlas_0709_isolated_components.sync_cuda",
+        fake_sync_cuda,
+    )
+    paired = measure_paired_critical_path_components(
+        setup_a=lambda: setup("A"),
+        step_a=advance_fake_state,
+        arm_a_name="native",
+        setup_b=lambda: setup("B"),
+        step_b=advance_fake_state,
+        arm_b_name="atlas",
+        depth=2,
+        warmup=0,
+        iters=4,
+        order_seed=0,
+    )
+
+    assert setup_order == ["A", "B", "B", "A", "A", "B", "B", "A"]
+    assert setup_counts == {"A": 4, "B": 4}
+    assert paired.measurement_protocol["measured_round_orders"] == [
+        "AB",
+        "BA",
+        "AB",
+        "BA",
+    ]
+    assert paired.measurement_protocol["complete_abba_blocks"] == 2
+    assert len(paired.arm_a.total.samples_ms) == 4
+    assert len(paired.arm_b.total.samples_ms) == 4
+    assert paired.arm_a.measurement_syncs["host_barriers_between_depths"] == 0
+    assert paired.arm_a.measurement_syncs["measured_per_iteration"] == 2
+    assert sync_calls == 16
+    assert paired.arm_a.to_dict()["hot_path_counter_total_delta"]["work"][
+        "samples"
+    ] == [3, 3, 3, 3]
+    assert len(paired.paired_comparison["blocks"]) == 2
+
+
+def test_paired_critical_path_rejects_incomplete_abba_block() -> None:
+    with pytest.raises(ValueError, match="positive even"):
+        measure_paired_critical_path_components(
+            setup_a=make_fake_state,
+            step_a=advance_fake_state,
+            arm_a_name="a",
+            setup_b=make_fake_state,
+            step_b=advance_fake_state,
+            arm_b_name="b",
+            depth=1,
+            warmup=0,
+            iters=3,
+            order_seed=0,
+        )
+
+
+class FakeNativeReqPool:
+    def __init__(self) -> None:
+        self.table = torch.full((2, 16), -1, dtype=torch.long)
+        self.write_calls = 0
+
+    def write(self, indices, values: torch.Tensor) -> None:
+        self.write_calls += 1
+        self.table[indices] = values
+
+
+class FakeNativeRoutePool:
+    def __init__(self) -> None:
+        self.page_size = 4
+        self.use_page_attention_metadata = True
+        self.validate_page_layout = True
+        self.req_to_token_pool = FakeNativeReqPool()
+        self.route_rows = {
+            10: SimpleNamespace(written_length=4, pending_dirty_start=None),
+            11: SimpleNamespace(written_length=4, pending_dirty_start=None),
+        }
+        self.route_slot_paths: dict[int, torch.Tensor] = {}
+        self.route_tail_page_keys = {10: -10, 11: -11}
+        self.pending_owned_slot_tensors: list[torch.Tensor] = []
+        self.next_tail_page_key = 100
+        self.last_allocate_args = None
+
+    def allocate_decode_slots(self, *, seq_lens, last_locs) -> torch.Tensor:
+        self.last_allocate_args = (list(seq_lens), last_locs.clone())
+        return torch.tensor([8, 12], dtype=torch.long)
+
+    def _record_pending_owned_slots(self, slots: torch.Tensor) -> None:
+        self.pending_owned_slot_tensors.append(slots.clone())
+
+    def _new_tail_page_key(self) -> int:
+        self.next_tail_page_key += 1
+        return -self.next_tail_page_key
+
+
+class FakeNativeExecutor:
+    def __init__(self) -> None:
+        self.metadata = None
+        self.input_ids = None
+
+    def forward_frontier(self, *, input_ids, route_kv_metadata) -> torch.Tensor:
+        self.input_ids = input_ids.clone()
+        self.metadata = route_kv_metadata
+        return torch.tensor(
+            [[0.0, 1.0, 3.0], [4.0, 1.0, 0.0]],
+            dtype=torch.float32,
+        )
+
+
+def test_native_batch_ar_step_is_batched_gpu_resident_shape_path() -> None:
+    pool = FakeNativeRoutePool()
+    executor = FakeNativeExecutor()
+    state = NativeBatchARState(
+        context=SimpleNamespace(
+            backend=SimpleNamespace(route_pool=pool, executor=executor)
+        ),
+        route_ids=[10, 11],
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.long),
+        slot_paths=[
+            torch.tensor([0, 1, 2, 3], dtype=torch.long),
+            torch.tensor([4, 5, 6, 7], dtype=torch.long),
+        ],
+        input_ids=torch.tensor([5, 6], dtype=torch.long),
+        sequence_length=4,
+        counter_totals={
+            "attention_metadata_builds": 0,
+            "attention_metadata_token_indices": 0,
+            "attention_metadata_page_indices": 0,
+            "req_row_write_calls": 0,
+            "req_row_elements_written": 0,
+            "req_row_append_calls": 0,
+            "req_row_append_elements": 0,
+            "native_gpu_argmax_calls": 0,
+            "native_req_row_batch_write_calls": 0,
+        },
+    )
+
+    result = run_native_batch_ar_step(state)
+
+    assert pool.last_allocate_args[0] == [5, 5]
+    assert pool.last_allocate_args[1].tolist() == [3, 7]
+    assert pool.req_to_token_pool.write_calls == 1
+    assert pool.req_to_token_pool.table[:, 4].tolist() == [8, 12]
+    assert state.sequence_length == 5
+    assert state.input_ids.tolist() == [2, 0]
+    assert [path.tolist() for path in state.slot_paths] == [
+        [0, 1, 2, 3, 8],
+        [4, 5, 6, 7, 12],
+    ]
+    assert pool.route_rows[10].written_length == 5
+    assert pool.route_rows[11].written_length == 5
+    assert len(pool.pending_owned_slot_tensors) == 1
+    assert executor.input_ids.tolist() == [5, 6]
+    metadata = executor.metadata
+    assert metadata.seq_lens_cpu.tolist() == [5, 5]
+    assert metadata.seq_lens_sum == 10
+    assert metadata.positions.tolist() == [4, 4]
+    assert metadata.attention_page_size == 4
+    assert metadata.token_index_count == 10
+    assert metadata.page_index_count == 4
+    assert metadata.paged_decode_spec.kv_indices.tolist() == [0, 2, 1, 3]
+    assert state.counter_totals["req_row_append_elements"] == 2
+    assert state.counter_totals["native_gpu_argmax_calls"] == 1
+    assert result.decode_output.metadata["candidate_host_transfer"] is False
