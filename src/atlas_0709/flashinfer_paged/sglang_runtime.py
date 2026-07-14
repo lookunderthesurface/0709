@@ -395,6 +395,87 @@ class SGLangRoutePoolBridge:
                 counts[page_id] = counts.get(page_id, 0) + 1
         return dict(sorted(counts.items()))
 
+    def validate_route_physical_state(self, route: RouteState) -> None:
+        """Validate a route-local physical KV path and its request row.
+
+        ``node_slot_ids`` records where a logical node was first materialized.
+        It is not an authoritative route-local mapping: partial-tail
+        copy-on-write can give the same logical node a private physical copy,
+        and the canonical page can later be released.  The route path and its
+        request row are the physical source of truth.
+        """
+        route_id = int(route.route_id)
+        slot_path = self.route_slot_paths.get(route_id)
+        if slot_path is None:
+            raise RuntimeError(f"Drafter route {route_id} has no physical slot path")
+
+        committed_length = int(route.kv_view.prefix.committed_length)
+        expected_length = committed_length + len(route.kv_view.node_ids)
+        actual_slots = _int_list(slot_path)
+        if len(actual_slots) != expected_length:
+            raise RuntimeError(
+                f"Drafter route {route_id} physical length does not match logical KV: "
+                f"physical={len(actual_slots)}, committed={committed_length}, "
+                f"nodes={len(route.kv_view.node_ids)}"
+            )
+
+        missing_nodes = [
+            int(node_id)
+            for node_id in route.kv_view.node_ids
+            if int(node_id) not in self.node_slot_ids
+        ]
+        if missing_nodes:
+            raise RuntimeError(
+                f"Drafter route {route_id} has logical nodes without materialized KV: "
+                f"node_ids={missing_nodes}"
+            )
+
+        for logical_position, slot_id in enumerate(actual_slots):
+            page_offset = logical_position % int(self.page_size)
+            if slot_id % int(self.page_size) != page_offset:
+                raise RuntimeError(
+                    f"Drafter route {route_id} physical page layout is invalid: "
+                    f"logical_position={logical_position}, slot_id={slot_id}, "
+                    f"expected_page_offset={page_offset}"
+                )
+            if page_offset and slot_id != actual_slots[logical_position - 1] + 1:
+                raise RuntimeError(
+                    f"Drafter route {route_id} physical page is not contiguous: "
+                    f"logical_position={logical_position}, "
+                    f"previous_slot={actual_slots[logical_position - 1]}, "
+                    f"slot_id={slot_id}"
+                )
+
+        self._materialize_pending_owned_pages()
+        route_pages = {
+            int(slot_id) // int(self.page_size) for slot_id in actual_slots
+        }
+        unowned_pages = sorted(route_pages - self.owned_page_ids)
+        if unowned_pages:
+            raise RuntimeError(
+                f"Drafter route {route_id} references unowned KV pages: "
+                f"page_ids={unowned_pages}"
+            )
+
+        row = self.route_rows.get(route_id)
+        if row is None:
+            return
+        if int(row.written_length) != len(actual_slots):
+            raise RuntimeError(
+                f"Drafter route {route_id} req-row length is inconsistent: "
+                f"row={int(row.written_length)}, slots={len(actual_slots)}"
+            )
+        req_table = getattr(self.req_to_token_pool, "req_to_token", None)
+        if isinstance(req_table, torch.Tensor):
+            req_slots = _int_list(
+                req_table[int(row.req_pool_index), : len(actual_slots)]
+            )
+            if req_slots != actual_slots:
+                raise RuntimeError(
+                    f"Drafter route {route_id} req-row slots do not match its "
+                    "physical path"
+                )
+
     def _page_id_sets_for_paths(
         self,
         paths: Sequence[torch.Tensor | None],

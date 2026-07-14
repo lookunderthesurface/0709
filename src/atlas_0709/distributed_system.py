@@ -634,52 +634,7 @@ class PagedDistributedAtlasGenerator:
                 f"slots={observed_slots}, tokens={len(expected)}"
             )
         for route in active_routes:
-            route_id = int(route.route_id)
-            slot_path = ctx.backend.route_pool.route_slot_paths.get(route_id)
-            if slot_path is None:
-                raise RuntimeError(f"Drafter route {route_id} has no physical slot path")
-            actual_slots = [int(slot_id) for slot_id in slot_path.detach().cpu().tolist()]
-            expected_suffix: list[int] = []
-            for node_id in route.kv_view.node_ids:
-                slot_id = ctx.backend.route_pool.node_slot_ids.get(int(node_id))
-                if slot_id is None:
-                    raise RuntimeError(
-                        f"Drafter route {route_id} node {int(node_id)} has no physical KV slot"
-                    )
-                if isinstance(slot_id, torch.Tensor):
-                    expected_suffix.append(int(slot_id.detach().cpu()))
-                else:
-                    expected_suffix.append(int(slot_id))
-            committed_length = int(route.kv_view.prefix.committed_length)
-            if actual_slots[committed_length:] != expected_suffix:
-                raise RuntimeError(
-                    f"Drafter route {route_id} physical slots do not match its logical node path"
-                )
-            row = ctx.backend.route_pool.route_rows.get(route_id)
-            if row is not None and int(row.written_length) != len(actual_slots):
-                raise RuntimeError(
-                    f"Drafter route {route_id} req-row length is inconsistent: "
-                    f"row={int(row.written_length)}, slots={len(actual_slots)}"
-                )
-            req_table = getattr(
-                ctx.backend.route_pool.req_to_token_pool,
-                "req_to_token",
-                None,
-            )
-            if row is not None and isinstance(req_table, torch.Tensor):
-                req_slots = [
-                    int(slot_id)
-                    for slot_id in req_table[
-                        int(row.req_pool_index), : len(actual_slots)
-                    ]
-                    .detach()
-                    .cpu()
-                    .tolist()
-                ]
-                if req_slots != actual_slots:
-                    raise RuntimeError(
-                        f"Drafter route {route_id} req row does not match its physical slot path"
-                    )
+            ctx.backend.route_pool.validate_route_physical_state(route)
 
     def _prepare_prefix(self, committed: Sequence[int]) -> PagedPrefixContext:
         store = KVTreeStore()

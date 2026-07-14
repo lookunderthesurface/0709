@@ -352,6 +352,38 @@ def test_selected_route_promotion_does_not_rewrite_its_row() -> None:
     assert counters["req_row_full_init_calls"] == 0
 
 
+def test_physical_validation_accepts_live_cow_alias_after_promotion() -> None:
+    bridge = make_bridge()
+    bridge.set_prefix_slots(torch.tensor([0, 1, 2, 3], dtype=torch.long))
+    route = make_route(
+        45,
+        committed_length=4,
+        node_ids=(100, 101),
+    )
+
+    # These nodes were first materialized on page 1.  Tail-page COW copied
+    # their KV to private page 10, after which page 1 was released.  The
+    # canonical node slots therefore must not be treated as route-local slots.
+    bridge.node_slot_ids = {100: 4, 101: 5}
+    bridge.route_slot_paths[45] = torch.tensor(
+        [0, 1, 2, 3, 40, 41],
+        dtype=torch.long,
+    )
+    bridge.owned_page_ids.add(10)
+    bridge.bind_existing_route_row(45, 0, written_length=6)
+    bridge.req_to_token_pool.req_to_token[0, :6] = bridge.route_slot_paths[45]
+
+    bridge.validate_route_physical_state(route)
+
+    bridge.owned_page_ids.remove(10)
+    try:
+        bridge.validate_route_physical_state(route)
+    except RuntimeError as exc:
+        assert "unowned KV pages" in str(exc)
+    else:
+        raise AssertionError("physical validation accepted a released COW page")
+
+
 def test_failed_req_row_write_does_not_increment_counters() -> None:
     bridge = make_bridge(req_pool=AlwaysFailReqPool())
 
